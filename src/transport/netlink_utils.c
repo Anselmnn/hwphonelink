@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
+#include <gio/gio.h>
 
 struct _HwPhoneLinkNlHandle {
   struct nl_sock *sock;
@@ -21,11 +22,11 @@ struct _HwPhoneLinkNlHandle {
   int nl80211_id;
 };
 
-static int _wait_for_ack(struct nl_sock *sock, void *arg) {
+static int _wait_for_ack(struct nl_msg *msg, void *arg) {
   return NL_OK;
 }
 
-static int _no_seq_check(struct nl_sock *sock, struct nlmsghdr *hdr, void *arg) {
+static int _no_seq_check(struct nl_msg *msg, void *arg) {
   return NL_OK;
 }
 
@@ -91,9 +92,10 @@ gboolean hw_phone_link_nl_create_ap_interface(HwPhoneLinkNlHandle *handle,
     return FALSE;
   }
 
-  int phy_idx = nl_get_multicast_id(handle->sock, "nl80211", phy_name);
-  if (phy_idx < 0) {
-    phy_idx = atoi(phy_name + 3); // "phy0" -> 0
+  // Parse phy index from name (e.g., "phy0" -> 0)
+  int phy_idx = 0;
+  if (g_str_has_prefix(phy_name, "phy")) {
+    phy_idx = atoi(phy_name + 3);
   }
 
   if (phy_idx >= 0) {
@@ -287,8 +289,7 @@ gboolean hw_phone_link_nl_wait_interface(HwPhoneLinkNlHandle *handle,
                                           gboolean should_exist,
                                           guint timeout_ms,
                                           GError **error) {
-  GTimeVal start;
-  g_get_current_time(&start);
+  gint64 start = g_get_monotonic_time();
 
   while (TRUE) {
     struct rtnl_link *link = rtnl_link_get_by_name(handle->link_cache, ifname);
@@ -297,9 +298,8 @@ gboolean hw_phone_link_nl_wait_interface(HwPhoneLinkNlHandle *handle,
 
     if (exists == should_exist) return TRUE;
 
-    GTimeVal now;
-    g_get_current_time(&now);
-    if (g_time_val_diff(&start, &now) > (long)timeout_ms * 1000) {
+    gint64 elapsed = g_get_monotonic_time() - start;
+    if (elapsed > (gint64)timeout_ms * 1000) {
       g_set_error(error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
                   "Timeout waiting for interface %s to %s",
                   ifname, should_exist ? "appear" : "disappear");

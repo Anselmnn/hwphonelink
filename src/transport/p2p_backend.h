@@ -10,15 +10,6 @@
 #include "wifi_transport.h"
 
 typedef struct _HwPhoneLinkP2PBackend HwPhoneLinkP2PBackend;
-typedef struct _HwPhoneLinkP2PBackendClass HwPhoneLinkP2PBackendClass;
-
-struct _HwPhoneLinkP2PBackend {
-  HwPhoneLinkTransport parent_instance;
-};
-
-struct _HwPhoneLinkP2PBackendClass {
-  HwPhoneLinkTransportClass parent_class;
-};
 
 #define HWPHONELINK_TYPE_P2P_BACKEND (hw_phone_link_p2p_backend_get_type())
 G_DECLARE_FINAL_TYPE(HwPhoneLinkP2PBackend, hw_phone_link_p2p_backend,

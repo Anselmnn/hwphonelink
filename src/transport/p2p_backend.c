@@ -14,20 +14,30 @@
 
 struct _HwPhoneLinkP2PBackend {
   HwPhoneLinkTransport parent_instance;
+};
 
+typedef struct {
   HwPhoneLinkP2PConfig config;
   HwPhoneLinkNlHandle *nl_handle;
   GSubprocess *wpa_supplicant_proc;
   HwPhoneLinkState state;
   GMutex state_mutex;
-};
+} HwPhoneLinkP2PBackendPrivate;
 
-G_DEFINE_TYPE(HwPhoneLinkP2PBackend, hw_phone_link_p2p_backend, HWPHONELINK_TYPE_TRANSPORT)
+G_DEFINE_TYPE_WITH_PRIVATE(HwPhoneLinkP2PBackend, hw_phone_link_p2p_backend, HWPHONELINK_TYPE_TRANSPORT)
+
+#define HWPHONELINK_P2P_BACKEND_GET_PRIVATE(obj) \
+  (hw_phone_link_p2p_backend_get_instance_private(HWPHONELINK_P2P_BACKEND(obj)))
+
+static HwPhoneLinkP2PBackendPrivate* _priv(HwPhoneLinkP2PBackend *self) {
+  return HWPHONELINK_P2P_BACKEND_GET_PRIVATE(self);
+}
 
 static void hw_phone_link_p2p_backend_finalize(GObject *object) {
   HwPhoneLinkP2PBackend *self = HWPHONELINK_P2P_BACKEND(object);
-  g_mutex_clear(&self->state_mutex);
-  if (self->nl_handle) hw_phone_link_nl_handle_free(self->nl_handle);
+  HwPhoneLinkP2PBackendPrivate *priv = _priv(self);
+  g_mutex_clear(&priv->state_mutex);
+  if (priv->nl_handle) hw_phone_link_nl_handle_free(priv->nl_handle);
   G_OBJECT_CLASS(hw_phone_link_p2p_backend_parent_class)->finalize(object);
 }
 
@@ -67,23 +77,23 @@ static gboolean _generate_wpa_supplicant_conf(const HwPhoneLinkP2PConfig *config
 static gboolean hw_phone_link_p2p_backend_start(HwPhoneLinkTransport *transport, GError **error) {
   HwPhoneLinkP2PBackend *self = HWPHONELINK_P2P_BACKEND(transport);
 
-  g_mutex_lock(&self->state_mutex);
-  if (self->state != HWPHONELINK_STATE_STOPPED) {
-    g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  if (_priv(self)->state != HWPHONELINK_STATE_STOPPED) {
+    g_mutex_unlock(&_priv(self)->state_mutex);
     g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Already running");
     return FALSE;
   }
-  self->state = HWPHONELINK_STATE_STARTING;
-  g_mutex_unlock(&self->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STARTING;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   // Generate wpa_supplicant config
-  if (!_generate_wpa_supplicant_conf(&self->config, error)) return FALSE;
+  if (!_generate_wpa_supplicant_conf(&_priv(self)->config, error)) return FALSE;
 
   // Start wpa_supplicant with P2P
   gchar *argv[] = {
     "wpa_supplicant",
-    "-i", self->config.ap_interface,
-    "-c", self->config.wpa_supplicant_conf,
+    "-i", _priv(self)->config.ap_interface,
+    "-c", _priv(self)->config.wpa_supplicant_conf,
     "-D", "nl80211",
     "-B",
     NULL
@@ -92,18 +102,18 @@ static gboolean hw_phone_link_p2p_backend_start(HwPhoneLinkTransport *transport,
   GSubprocess *proc = g_subprocess_launcher_spawnv(
     g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_NONE),
     (const gchar* const*)argv,
-    NULL, NULL, NULL, NULL, NULL, error
+    error
   );
 
   if (!proc) return FALSE;
-  self->wpa_supplicant_proc = proc;
+  _priv(self)->wpa_supplicant_proc = proc;
 
   // TODO: Use wpa_cli to start P2P-GO
   // wpa_cli -i wlp1s0 p2p_group_add freq=5200
 
-  g_mutex_lock(&self->state_mutex);
-  self->state = HWPHONELINK_STATE_RUNNING;
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_RUNNING;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   return TRUE;
 }
@@ -111,37 +121,37 @@ static gboolean hw_phone_link_p2p_backend_start(HwPhoneLinkTransport *transport,
 static gboolean hw_phone_link_p2p_backend_stop(HwPhoneLinkTransport *transport, GError **error) {
   HwPhoneLinkP2PBackend *self = HWPHONELINK_P2P_BACKEND(transport);
 
-  g_mutex_lock(&self->state_mutex);
-  if (self->state == HWPHONELINK_STATE_STOPPED) {
-    g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  if (_priv(self)->state == HWPHONELINK_STATE_STOPPED) {
+    g_mutex_unlock(&_priv(self)->state_mutex);
     return TRUE;
   }
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
-  if (self->wpa_supplicant_proc) {
-    g_subprocess_force_exit(self->wpa_supplicant_proc);
-    g_object_unref(self->wpa_supplicant_proc);
-    self->wpa_supplicant_proc = NULL;
+  if (_priv(self)->wpa_supplicant_proc) {
+    g_subprocess_force_exit(_priv(self)->wpa_supplicant_proc);
+    g_object_unref(_priv(self)->wpa_supplicant_proc);
+    _priv(self)->wpa_supplicant_proc = NULL;
   }
 
-  g_mutex_lock(&self->state_mutex);
-  self->state = HWPHONELINK_STATE_STOPPED;
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STOPPED;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   return TRUE;
 }
 
 static HwPhoneLinkState hw_phone_link_p2p_backend_get_state(HwPhoneLinkTransport *transport) {
   HwPhoneLinkP2PBackend *self = HWPHONELINK_P2P_BACKEND(transport);
-  g_mutex_lock(&self->state_mutex);
-  HwPhoneLinkState state = self->state;
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  HwPhoneLinkState state = _priv(self)->state;
+  g_mutex_unlock(&_priv(self)->state_mutex);
   return state;
 }
 
 static const gchar* hw_phone_link_p2p_backend_get_ap_interface(HwPhoneLinkTransport *transport) {
   HwPhoneLinkP2PBackend *self = HWPHONELINK_P2P_BACKEND(transport);
-  return self->config.ap_interface;
+  return _priv(self)->config.ap_interface;
 }
 
 static const gchar* hw_phone_link_p2p_backend_get_ap_ip(HwPhoneLinkTransport *transport) {
@@ -150,7 +160,7 @@ static const gchar* hw_phone_link_p2p_backend_get_ap_ip(HwPhoneLinkTransport *tr
 
 static guint hw_phone_link_p2p_backend_get_ap_channel(HwPhoneLinkTransport *transport) {
   HwPhoneLinkP2PBackend *self = HWPHONELINK_P2P_BACKEND(transport);
-  return self->config.channel;
+  return _priv(self)->config.channel;
 }
 
 static void hw_phone_link_p2p_backend_class_init(HwPhoneLinkP2PBackendClass *klass) {
@@ -168,23 +178,23 @@ static void hw_phone_link_p2p_backend_class_init(HwPhoneLinkP2PBackendClass *kla
 }
 
 static void hw_phone_link_p2p_backend_init(HwPhoneLinkP2PBackend *self) {
-  g_mutex_init(&self->state_mutex);
-  self->state = HWPHONELINK_STATE_STOPPED;
+  g_mutex_init(&_priv(self)->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STOPPED;
 
-  self->config.ap_interface = g_strdup("p2p-wlp1s0-0");
-  self->config.sta_interface = g_strdup("wlp1s0");
-  self->config.phy_name = g_strdup("phy0");
-  self->config.wpa_supplicant_conf = g_strdup("/etc/hwphonelink/wpa_supplicant_p2p.conf");
-  self->config.p2p_device_name = g_strdup("HUAWEI_PC_P2P");
-  self->config.channel = HWPHONELINK_DEFAULT_CHANNEL;
+  _priv(self)->config.ap_interface = g_strdup("p2p-wlp1s0-0");
+  _priv(self)->config.sta_interface = g_strdup("wlp1s0");
+  _priv(self)->config.phy_name = g_strdup("phy0");
+  _priv(self)->config.wpa_supplicant_conf = g_strdup("/etc/hwphonelink/wpa_supplicant_p2p.conf");
+  _priv(self)->config.p2p_device_name = g_strdup("HUAWEI_PC_P2P");
+  _priv(self)->config.channel = HWPHONELINK_DEFAULT_CHANNEL;
 }
 
 HwPhoneLinkTransport* hw_phone_link_p2p_backend_new(const gchar *phy_name,
                                                      const gchar *sta_interface,
                                                      GError **error) {
   HwPhoneLinkP2PBackend *self = g_object_new(HWPHONELINK_TYPE_P2P_BACKEND, NULL);
-  self->nl_handle = hw_phone_link_nl_handle_new(error);
-  if (!self->nl_handle) {
+  _priv(self)->nl_handle = hw_phone_link_nl_handle_new(error);
+  if (!_priv(self)->nl_handle) {
     g_object_unref(self);
     return NULL;
   }

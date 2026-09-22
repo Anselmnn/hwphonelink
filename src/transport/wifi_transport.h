@@ -33,10 +33,6 @@ typedef enum {
 typedef struct _HwPhoneLinkTransport HwPhoneLinkTransport;
 typedef struct _HwPhoneLinkTransportClass HwPhoneLinkTransportClass;
 
-struct _HwPhoneLinkTransport {
-  GObject parent_instance;
-};
-
 struct _HwPhoneLinkTransportClass {
   GObjectClass parent_class;
 
@@ -67,6 +63,10 @@ const gchar* hw_phone_link_transport_get_ap_ip(HwPhoneLinkTransport *self);
 guint hw_phone_link_transport_get_ap_channel(HwPhoneLinkTransport *self);
 
 /* Signal: state-changed (old_state, new_state) */
+/* GType for state enum */
+#define HWPHONELINK_TYPE_STATE (hw_phone_link_state_get_type())
+GType hw_phone_link_state_get_type(void);
+
 #define HWPHONELINK_TRANSPORT_SIGNAL_STATE_CHANGED "state-changed"
 
 /* Signal: client-connected (mac, ip) */

@@ -17,7 +17,9 @@
 
 struct _HwPhoneLinkSoftapBackend {
   HwPhoneLinkTransport parent_instance;
+};
 
+typedef struct {
   HwPhoneLinkSoftapConfig config;
   HwPhoneLinkNlHandle *nl_handle;
   GSubprocess *hostapd_proc;
@@ -26,16 +28,32 @@ struct _HwPhoneLinkSoftapBackend {
   GMutex state_mutex;
   guint hostapd_pid;
   guint dnsmasq_pid;
-};
+} HwPhoneLinkSoftapBackendPrivate;
 
-G_DEFINE_TYPE(HwPhoneLinkSoftapBackend, hw_phone_link_softap_backend, HWPHONELINK_TYPE_TRANSPORT)
+G_DEFINE_TYPE_WITH_PRIVATE(HwPhoneLinkSoftapBackend, hw_phone_link_softap_backend, HWPHONELINK_TYPE_TRANSPORT)
+
+#define HWPHONELINK_SOFTAP_BACKEND_GET_PRIVATE(obj) \
+  (hw_phone_link_softap_backend_get_instance_private(HWPHONELINK_SOFTAP_BACKEND(obj)))
+
+static HwPhoneLinkSoftapBackendPrivate* _priv(HwPhoneLinkSoftapBackend *self) {
+  return HWPHONELINK_SOFTAP_BACKEND_GET_PRIVATE(self);
+}
 
 static void hw_phone_link_softap_backend_finalize(GObject *object) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(object);
-  g_mutex_clear(&self->state_mutex);
-  hw_phone_link_softap_config_free(&self->config);
-  if (self->nl_handle) hw_phone_link_nl_handle_free(self->nl_handle);
+  HwPhoneLinkSoftapBackendPrivate *priv = _priv(self);
+  g_mutex_clear(&priv->state_mutex);
+  hw_phone_link_softap_config_free(&priv->config);
+  if (priv->nl_handle) hw_phone_link_nl_handle_free(priv->nl_handle);
   G_OBJECT_CLASS(hw_phone_link_softap_backend_parent_class)->finalize(object);
+}
+
+static HwPhoneLinkSoftapConfig* _config(HwPhoneLinkSoftapBackend *self) {
+  return &_priv(self)->config;
+}
+
+static HwPhoneLinkNlHandle* _nl_handle(HwPhoneLinkSoftapBackend *self) {
+  return _priv(self)->nl_handle;
 }
 
 static gboolean _ensure_dirs(const HwPhoneLinkSoftapConfig *config, GError **error) {
@@ -135,8 +153,8 @@ static gboolean _write_psk_file(const HwPhoneLinkSoftapConfig *config, GError **
 }
 
 static gboolean _start_hostapd(HwPhoneLinkSoftapBackend *self, GError **error) {
-  gchar *config_path = g_build_filename(self->config.config_dir, "hostapd.conf", NULL);
-  gchar *pid_path = g_build_filename(self->config.run_dir, "hostapd.pid", NULL);
+  gchar *config_path = g_build_filename(_priv(self)->config.config_dir, "hostapd.conf", NULL);
+  gchar *pid_path = g_build_filename(_priv(self)->config.run_dir, "hostapd.pid", NULL);
 
   gchar *argv[] = {
     "hostapd",
@@ -146,45 +164,32 @@ static gboolean _start_hostapd(HwPhoneLinkSoftapBackend *self, GError **error) {
     NULL
   };
 
-  g_autofree gchar *stdout_buf = NULL;
-  g_autofree gchar *stderr_buf = NULL;
-  gint exit_status;
-
-  gboolean res = g_subprocess_launcher_spawnv(
+  GSubprocess *proc = g_subprocess_launcher_spawnv(
     g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_NONE),
     (const gchar* const*)argv,
-    NULL,  // stdin
-    &stdout_buf,
-    &stderr_buf,
-    &exit_status,
-    NULL,
     error
   );
 
   g_free(config_path);
   g_free(pid_path);
 
-  if (!res) return FALSE;
-  if (exit_status != 0) {
-    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                "hostapd failed with exit %d: %s", exit_status, stderr_buf);
-    return FALSE;
-  }
+  if (!proc) return FALSE;
 
   // Read PID
   gchar *pid_content = NULL;
   if (g_file_get_contents(pid_path, &pid_content, NULL, NULL)) {
-    self->hostapd_pid = atoi(pid_content);
+    _priv(self)->hostapd_pid = atoi(pid_content);
     g_free(pid_content);
   }
 
+  g_object_unref(proc);
   return TRUE;
 }
 
 static gboolean _start_dnsmasq(HwPhoneLinkSoftapBackend *self, GError **error) {
-  gchar *config_path = g_build_filename(self->config.config_dir, "dnsmasq.conf", NULL);
-  gchar *pid_path = g_build_filename(self->config.run_dir, "dnsmasq.pid", NULL);
-  gchar *lease_path = g_build_filename(self->config.run_dir, "dnsmasq.leases", NULL);
+  gchar *config_path = g_build_filename(_priv(self)->config.config_dir, "dnsmasq.conf", NULL);
+  gchar *pid_path = g_build_filename(_priv(self)->config.run_dir, "dnsmasq.pid", NULL);
+  gchar *lease_path = g_build_filename(_priv(self)->config.run_dir, "dnsmasq.leases", NULL);
 
   gchar *argv[] = {
     "dnsmasq",
@@ -196,9 +201,9 @@ static gboolean _start_dnsmasq(HwPhoneLinkSoftapBackend *self, GError **error) {
   };
 
   GSubprocessLauncher *launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_NONE);
-  g_subprocess_launcher_set_environ(launcher, (const gchar* const*)g_get_environ(), TRUE);
+  g_subprocess_launcher_set_environ(launcher, (gchar**)g_get_environ());
 
-  GSubprocess *proc = g_subprocess_launcher_spawnv(launcher, (const gchar* const*)argv, NULL, NULL, NULL, error);
+  GSubprocess *proc = g_subprocess_launcher_spawnv(launcher, (const gchar* const*)argv, error);
   g_object_unref(launcher);
 
   if (!proc) {
@@ -208,12 +213,12 @@ static gboolean _start_dnsmasq(HwPhoneLinkSoftapBackend *self, GError **error) {
     return FALSE;
   }
 
-  self->dnsmasq_proc = proc;
+  _priv(self)->dnsmasq_proc = proc;
 
   // Read PID
   gchar *pid_content = NULL;
   if (g_file_get_contents(pid_path, &pid_content, NULL, NULL)) {
-    self->dnsmasq_pid = atoi(pid_content);
+    _priv(self)->dnsmasq_pid = atoi(pid_content);
     g_free(pid_content);
   }
 
@@ -238,24 +243,24 @@ static gboolean _stop_process(guint pid, const gchar *name) {
 static gboolean hw_phone_link_softap_backend_start(HwPhoneLinkTransport *transport, GError **error) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(transport);
 
-  g_mutex_lock(&self->state_mutex);
-  if (self->state != HWPHONELINK_STATE_STOPPED) {
-    g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  if (_priv(self)->state != HWPHONELINK_STATE_STOPPED) {
+    g_mutex_unlock(&_priv(self)->state_mutex);
     g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Already running");
     return FALSE;
   }
-  self->state = HWPHONELINK_STATE_STARTING;
-  g_mutex_unlock(&self->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STARTING;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   g_object_notify_by_pspec(G_OBJECT(transport), g_param_spec_enum("state", "", "", HWPHONELINK_TYPE_STATE, HWPHONELINK_STATE_STARTING, G_PARAM_READABLE));
 
   // 1. Ensure directories
-  if (!_ensure_dirs(&self->config, error)) return FALSE;
+  if (!_ensure_dirs(&_priv(self)->config, error)) return FALSE;
 
   // 2. Create AP interface via netlink
-  gchar *ap_ifname = g_strdup(self->config.ap_interface);
-  if (!hw_phone_link_nl_create_ap_interface(self->nl_handle,
-                                             self->config.phy_name,
+  gchar *ap_ifname = g_strdup(_priv(self)->config.ap_interface);
+  if (!hw_phone_link_nl_create_ap_interface(_priv(self)->nl_handle,
+                                             _priv(self)->config.phy_name,
                                              ap_ifname,
                                              error)) {
     g_free(ap_ifname);
@@ -264,18 +269,18 @@ static gboolean hw_phone_link_softap_backend_start(HwPhoneLinkTransport *transpo
   g_free(ap_ifname);
 
   // Wait for interface to appear
-  if (!hw_phone_link_nl_wait_interface(self->nl_handle, self->config.ap_interface, TRUE, 5000, error)) {
+  if (!hw_phone_link_nl_wait_interface(_priv(self)->nl_handle, _priv(self)->config.ap_interface, TRUE, 5000, error)) {
     return FALSE;
   }
 
   // 3. Set AP interface up
-  if (!hw_phone_link_nl_set_interface_up(self->nl_handle, self->config.ap_interface, TRUE, error)) {
+  if (!hw_phone_link_nl_set_interface_up(_priv(self)->nl_handle, _priv(self)->config.ap_interface, TRUE, error)) {
     return FALSE;
   }
 
   // 4. Add IP address
-  gchar *ip_cidr = g_strdup_printf("%s/24", self->config.ap_ip);
-  if (!hw_phone_link_nl_add_ip_address(self->nl_handle, self->config.ap_interface, ip_cidr, error)) {
+  gchar *ip_cidr = g_strdup_printf("%s/24", _priv(self)->config.ap_ip);
+  if (!hw_phone_link_nl_add_ip_address(_priv(self)->nl_handle, _priv(self)->config.ap_interface, ip_cidr, error)) {
     g_free(ip_cidr);
     return FALSE;
   }
@@ -284,27 +289,27 @@ static gboolean hw_phone_link_softap_backend_start(HwPhoneLinkTransport *transpo
   // 5. Block NetworkManager from managing AP interface
   GSubprocess *nmcli = g_subprocess_launcher_spawnv(
     g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_NONE),
-    (const gchar* const[]){"nmcli", "device", "set", self->config.ap_interface, "managed", "no", NULL},
-    NULL, NULL, NULL, NULL, NULL, error
+    (const gchar* const[]){"nmcli", "device", "set", _priv(self)->config.ap_interface, "managed", "no", NULL},
+    error
   );
   if (nmcli) g_object_unref(nmcli);
 
   // 6. Generate configs
-  if (!_generate_hostapd_conf(&self->config, error)) return FALSE;
-  if (!_generate_dnsmasq_conf(&self->config, error)) return FALSE;
-  if (!_write_psk_file(&self->config, error)) return FALSE;
+  if (!_generate_hostapd_conf(&_priv(self)->config, error)) return FALSE;
+  if (!_generate_dnsmasq_conf(&_priv(self)->config, error)) return FALSE;
+  if (!_write_psk_file(&_priv(self)->config, error)) return FALSE;
 
   // 7. Start hostapd
   if (!_start_hostapd(self, error)) {
-    self->state = HWPHONELINK_STATE_ERROR;
+    _priv(self)->state = HWPHONELINK_STATE_ERROR;
     return FALSE;
   }
 
   // 8. Start dnsmasq
   if (!_start_dnsmasq(self, error)) {
-    _stop_process(self->hostapd_pid, "hostapd");
-    self->hostapd_pid = 0;
-    self->state = HWPHONELINK_STATE_ERROR;
+    _stop_process(_priv(self)->hostapd_pid, "hostapd");
+    _priv(self)->hostapd_pid = 0;
+    _priv(self)->state = HWPHONELINK_STATE_ERROR;
     return FALSE;
   }
 
@@ -317,13 +322,13 @@ static gboolean hw_phone_link_softap_backend_start(HwPhoneLinkTransport *transpo
       "iptables -A FORWARD -i wlp1s0_ap -o wlp1s0 -j ACCEPT && "
       "iptables -A FORWARD -i wlp1s0 -o wlp1s0_ap -m state --state RELATED,ESTABLISHED -j ACCEPT",
       NULL},
-    NULL, NULL, NULL, NULL, NULL, error
+    error
   );
   if (iptables) g_object_unref(iptables);
 
-  g_mutex_lock(&self->state_mutex);
-  self->state = HWPHONELINK_STATE_RUNNING;
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_RUNNING;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   g_object_notify_by_pspec(G_OBJECT(transport), g_param_spec_enum("state", "", "", HWPHONELINK_TYPE_STATE, HWPHONELINK_STATE_RUNNING, G_PARAM_READABLE));
   g_signal_emit_by_name(transport, "state-changed", HWPHONELINK_STATE_STARTING, HWPHONELINK_STATE_RUNNING);
@@ -334,28 +339,28 @@ static gboolean hw_phone_link_softap_backend_start(HwPhoneLinkTransport *transpo
 static gboolean hw_phone_link_softap_backend_stop(HwPhoneLinkTransport *transport, GError **error) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(transport);
 
-  g_mutex_lock(&self->state_mutex);
-  if (self->state == HWPHONELINK_STATE_STOPPED || self->state == HWPHONELINK_STATE_STOPPING) {
-    g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  if (_priv(self)->state == HWPHONELINK_STATE_STOPPED || _priv(self)->state == HWPHONELINK_STATE_STOPPING) {
+    g_mutex_unlock(&_priv(self)->state_mutex);
     return TRUE;
   }
-  self->state = HWPHONELINK_STATE_STOPPING;
-  g_mutex_unlock(&self->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STOPPING;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   g_object_notify_by_pspec(G_OBJECT(transport), g_param_spec_enum("state", "", "", HWPHONELINK_TYPE_STATE, HWPHONELINK_STATE_STOPPING, G_PARAM_READABLE));
 
   // Stop dnsmasq
-  if (self->dnsmasq_proc) {
-    g_subprocess_force_exit(self->dnsmasq_proc);
-    g_object_unref(self->dnsmasq_proc);
-    self->dnsmasq_proc = NULL;
+  if (_priv(self)->dnsmasq_proc) {
+    g_subprocess_force_exit(_priv(self)->dnsmasq_proc);
+    g_object_unref(_priv(self)->dnsmasq_proc);
+    _priv(self)->dnsmasq_proc = NULL;
   }
-  _stop_process(self->dnsmasq_pid, "dnsmasq");
-  self->dnsmasq_pid = 0;
+  _stop_process(_priv(self)->dnsmasq_pid, "dnsmasq");
+  _priv(self)->dnsmasq_pid = 0;
 
   // Stop hostapd
-  _stop_process(self->hostapd_pid, "hostapd");
-  self->hostapd_pid = 0;
+  _stop_process(_priv(self)->hostapd_pid, "hostapd");
+  _priv(self)->hostapd_pid = 0;
 
   // Remove iptables rules
   GSubprocess *iptables = g_subprocess_launcher_spawnv(
@@ -365,24 +370,24 @@ static gboolean hw_phone_link_softap_backend_stop(HwPhoneLinkTransport *transpor
       "iptables -D FORWARD -i wlp1s0_ap -o wlp1s0 -j ACCEPT 2>/dev/null; "
       "iptables -D FORWARD -i wlp1s0 -o wlp1s0_ap -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null",
       NULL},
-    NULL, NULL, NULL, NULL, NULL, NULL
+    NULL
   );
   if (iptables) g_object_unref(iptables);
 
   // Remove IP address
-  gchar *ip_cidr = g_strdup_printf("%s/24", self->config.ap_ip);
-  hw_phone_link_nl_remove_ip_address(self->nl_handle, self->config.ap_interface, ip_cidr, NULL);
+  gchar *ip_cidr = g_strdup_printf("%s/24", _priv(self)->config.ap_ip);
+  hw_phone_link_nl_remove_ip_address(_priv(self)->nl_handle, _priv(self)->config.ap_interface, ip_cidr, NULL);
   g_free(ip_cidr);
 
   // Set interface down
-  hw_phone_link_nl_set_interface_up(self->nl_handle, self->config.ap_interface, FALSE, NULL);
+  hw_phone_link_nl_set_interface_up(_priv(self)->nl_handle, _priv(self)->config.ap_interface, FALSE, NULL);
 
   // Delete AP interface
-  hw_phone_link_nl_delete_interface(self->nl_handle, self->config.ap_interface, NULL);
+  hw_phone_link_nl_delete_interface(_priv(self)->nl_handle, _priv(self)->config.ap_interface, NULL);
 
-  g_mutex_lock(&self->state_mutex);
-  self->state = HWPHONELINK_STATE_STOPPED;
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STOPPED;
+  g_mutex_unlock(&_priv(self)->state_mutex);
 
   g_object_notify_by_pspec(G_OBJECT(transport), g_param_spec_enum("state", "", "", HWPHONELINK_TYPE_STATE, HWPHONELINK_STATE_STOPPED, G_PARAM_READABLE));
   g_signal_emit_by_name(transport, "state-changed", HWPHONELINK_STATE_STOPPING, HWPHONELINK_STATE_STOPPED);
@@ -392,25 +397,25 @@ static gboolean hw_phone_link_softap_backend_stop(HwPhoneLinkTransport *transpor
 
 static HwPhoneLinkState hw_phone_link_softap_backend_get_state(HwPhoneLinkTransport *transport) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(transport);
-  g_mutex_lock(&self->state_mutex);
-  HwPhoneLinkState state = self->state;
-  g_mutex_unlock(&self->state_mutex);
+  g_mutex_lock(&_priv(self)->state_mutex);
+  HwPhoneLinkState state = _priv(self)->state;
+  g_mutex_unlock(&_priv(self)->state_mutex);
   return state;
 }
 
 static const gchar* hw_phone_link_softap_backend_get_ap_interface(HwPhoneLinkTransport *transport) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(transport);
-  return self->config.ap_interface;
+  return _priv(self)->config.ap_interface;
 }
 
 static const gchar* hw_phone_link_softap_backend_get_ap_ip(HwPhoneLinkTransport *transport) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(transport);
-  return self->config.ap_ip;
+  return _priv(self)->config.ap_ip;
 }
 
 static guint hw_phone_link_softap_backend_get_ap_channel(HwPhoneLinkTransport *transport) {
   HwPhoneLinkSoftapBackend *self = HWPHONELINK_SOFTAP_BACKEND(transport);
-  return self->config.channel;
+  return _priv(self)->config.channel;
 }
 
 static void hw_phone_link_softap_backend_class_init(HwPhoneLinkSoftapBackendClass *klass) {
@@ -428,8 +433,8 @@ static void hw_phone_link_softap_backend_class_init(HwPhoneLinkSoftapBackendClas
 }
 
 static void hw_phone_link_softap_backend_init(HwPhoneLinkSoftapBackend *self) {
-  g_mutex_init(&self->state_mutex);
-  self->state = HWPHONELINK_STATE_STOPPED;
+  g_mutex_init(&_priv(self)->state_mutex);
+  _priv(self)->state = HWPHONELINK_STATE_STOPPED;
 }
 
 void hw_phone_link_softap_config_init(HwPhoneLinkSoftapConfig *config,
@@ -470,10 +475,10 @@ HwPhoneLinkTransport* hw_phone_link_softap_backend_new(const gchar *phy_name,
                                                         GError **error) {
   HwPhoneLinkSoftapBackend *self = g_object_new(HWPHONELINK_TYPE_SOFTAP_BACKEND, NULL);
 
-  hw_phone_link_softap_config_init(&self->config, phy_name, sta_interface);
+  hw_phone_link_softap_config_init(&_priv(self)->config, phy_name, sta_interface);
 
-  self->nl_handle = hw_phone_link_nl_handle_new(error);
-  if (!self->nl_handle) {
+  _priv(self)->nl_handle = hw_phone_link_nl_handle_new(error);
+  if (!_priv(self)->nl_handle) {
     g_object_unref(self);
     return NULL;
   }

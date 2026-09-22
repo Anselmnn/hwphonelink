@@ -10,6 +10,7 @@ project('hwphonelink', 'c',
 # Dependencies
 dep_libnl3 = dependency('libnl-3.0', required: true)
 dep_libnl_genl = dependency('libnl-genl-3.0', required: true)
+dep_libnl_route = dependency('libnl-route-3.0', required: true)
 dep_glib = dependency('glib-2.0', required: true)
 dep_gio = dependency('gio-2.0', required: true)
 dep_gobject = dependency('gobject-2.0', required: true)
@@ -53,7 +54,7 @@ transport_lib = library(
   'hwphonelink-transport',
   transport_sources,
   include_directories: include_directories('src'),
-  dependencies: [dep_libnl3, dep_libnl_genl, dep_glib, dep_gio, dep_gobject, thread_dep],
+  dependencies: [dep_libnl3, dep_libnl_genl, dep_libnl_route, dep_glib, dep_gio, dep_gobject, thread_dep],
   install: true,
   install_dir: libdir,
 )
@@ -63,19 +64,38 @@ daemon_sources = [
   'src/main.c',
 ]
 
+inc = include_directories('src')
+
 daemon = executable(
   'hwphonelinkd',
   daemon_sources,
-  dependencies: [transport_lib, dep_libnl3, dep_libnl_genl, dep_glib, dep_gio, dep_gobject, thread_dep],
+  link_with: transport_lib,
+  include_directories: inc,
+  dependencies: [dep_libnl3, dep_libnl_genl, dep_glib, dep_gio, dep_gobject, thread_dep],
   install: true,
   install_dir: bindir,
 )
 
 # Config templates
+conf_data = configuration_data()
+conf_data.set('PREFIX', prefix)
+conf_data.set('SYSCONFDIR', sysconfdir)
+conf_data.set('BINDIR', bindir)
+conf_data.set('AP_INTERFACE', 'wlp1s0_ap')
+conf_data.set('SSID', 'HUAWEI_PC')
+conf_data.set('HW_MODE', 'a')
+conf_data.set('CHANNEL', '40')
+conf_data.set('PASSPHRASE', '')
+conf_data.set('AP_IP', '192.168.137.1')
+conf_data.set('DHCP_START', '192.168.137.2')
+conf_data.set('DHCP_END', '192.168.137.254')
+conf_data.set('CONFIG_DIR', join_paths(sysconfdir, 'hwphonelink'))
+conf_data.set('RUN_DIR', '/run/hwphonelink')
+
 configure_file(
   input: 'data/hostapd.conf.template',
   output: 'hostapd.conf',
-  configuration: {'PREFIX': prefix, 'SYSCONFDIR': sysconfdir},
+  configuration: conf_data,
   install: true,
   install_dir: join_paths(sysconfdir, 'hwphonelink'),
 )
@@ -83,7 +103,7 @@ configure_file(
 configure_file(
   input: 'data/dnsmasq.conf.template',
   output: 'dnsmasq.conf',
-  configuration: {'PREFIX': prefix, 'SYSCONFDIR': sysconfdir},
+  configuration: conf_data,
   install: true,
   install_dir: join_paths(sysconfdir, 'hwphonelink'),
 )
@@ -92,15 +112,16 @@ configure_file(
 systemd_service = configure_file(
   input: 'systemd/hwphonelink.service.in',
   output: 'hwphonelink.service',
-  configuration: {'BINDIR': bindir},
+  configuration: conf_data,
   install: true,
   install_dir: systemd_unitdir,
 )
 
-# Udev rules
+# Udev rules (copy as-is, no substitution)
 udev_rules = configure_file(
   input: 'data/99-hwphonelink.rules',
   output: '99-hwphonelink.rules',
+  copy: true,
   install: true,
   install_dir: join_paths(prefix, 'lib', 'udev', 'rules.d'),
 )

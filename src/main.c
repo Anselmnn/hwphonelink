@@ -5,13 +5,14 @@
  * Supports dual Wi-Fi transport: SoftAP (primary) + P2P-GO (fallback).
  */
 
-#include "wifi_transport.h"
-#include "softap_backend.h"
-#include "p2p_backend.h"
+#include "transport/wifi_transport.h"
+#include "transport/softap_backend.h"
+#include "transport/p2p_backend.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static GMainLoop *main_loop = NULL;
 static HwPhoneLinkTransport *transport = NULL;
@@ -81,7 +82,6 @@ int main(int argc, char *argv[]) {
 
   context = g_option_context_new("- Huawei Multi-Screen Transport Daemon");
   g_option_context_add_main_entries(context, entries, NULL);
-  g_option_context_add_group(context, gtk_get_option_group(TRUE));
 
   if (!g_option_context_parse(context, &argc, &argv, &error)) {
     g_printerr("Option parsing failed: %s\n", error->message);

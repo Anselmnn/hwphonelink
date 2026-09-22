@@ -10,6 +10,7 @@
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
+#include <linux/nl80211.h>
 
 #define NL80211_CMD_NEW_INTERFACE 0x07
 #define NL80211_CMD_DEL_INTERFACE 0x08

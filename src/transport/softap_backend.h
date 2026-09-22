@@ -13,15 +13,6 @@
 #define HWPHONELINK_SOFTAP_RUN_DIR "/run/hwphonelink"
 
 typedef struct _HwPhoneLinkSoftapBackend HwPhoneLinkSoftapBackend;
-typedef struct _HwPhoneLinkSoftapBackendClass HwPhoneLinkSoftapBackendClass;
-
-struct _HwPhoneLinkSoftapBackend {
-  HwPhoneLinkTransport parent_instance;
-};
-
-struct _HwPhoneLinkSoftapBackendClass {
-  HwPhoneLinkTransportClass parent_class;
-};
 
 #define HWPHONELINK_TYPE_SOFTAP_BACKEND (hw_phone_link_softap_backend_get_type())
 G_DECLARE_FINAL_TYPE(HwPhoneLinkSoftapBackend, hw_phone_link_softap_backend,
