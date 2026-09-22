@@ -1,0 +1,14 @@
+# udev rules for hwphonelink
+# Allow hwphonelinkd to manage wireless interfaces
+
+# Allow netlink access for interface management
+KERNEL=="nl80211", MODE="0660", GROUP="netdev"
+
+# Allow hostapd/dnsmasq to create sockets
+SUBSYSTEM=="net", ACTION=="add", RUN+="/usr/bin/logger -t hwphonelink 'Interface %k added'"
+
+# P2P interface naming
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="p2p-*", NAME="p2p-%k"
+
+# Allow hwphonelinkd to manage iptables
+# (handled via systemd CapabilityBoundingSet)

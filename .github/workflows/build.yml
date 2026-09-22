@@ -1,0 +1,175 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  CC: gcc
+  CFLAGS: -O2 -pipe -fstack-protector-strong -fno-plt
+  LDFLAGS: -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now
+
+jobs:
+  build:
+    name: Build on Ubuntu
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --cap-add=CAP_DAC_OVERRIDE
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y \
+            meson ninja-build gcc pkg-config \
+            libnl-3-dev libnl-genl-3-dev \
+            libglib2.0-dev libgio2.0-dev \
+            hostapd dnsmasq iptables iproute2 \
+            wireless-tools iw \
+            systemd libsystemd-dev \
+            gobject-introspection libgirepository1.0-dev
+
+      - name: Configure with Meson
+        run: |
+          meson setup builddir \
+            --prefix=/usr \
+            --libdir=lib \
+            -Dbuildtype=release \
+            -Db_lto=true \
+            -Db_pie=true
+
+      - name: Build
+        run: |
+          ninja -C builddir -j$(nproc)
+
+      - name: Run tests
+        run: |
+          ninja -C builddir test
+
+      - name: Create package
+        run: |
+          DESTDIR=/tmp/install ninja -C builddir install
+          cd /tmp/install && tar -czf /github/workspace/hwphonelink-${{ github.ref_name }}-linux-x86_64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwphonelink-${{ github.ref_name }}-linux-x86_64
+          path: /github/workspace/hwphonelink-*-linux-x86_64.tar.gz
+
+  build-debian:
+    name: Build on Debian
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+      options: --privileged --cap-add=NET_ADMIN --cap-add=CAP_DAC_OVERRIDE
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y \
+            meson ninja-build gcc pkg-config \
+            libnl-3-dev libnl-genl-3-dev \
+            libglib2.0-dev libgio2.0-dev \
+            hostapd dnsmasq iptables iproute2 \
+            wireless-tools iw \
+            systemd libsystemd-dev \
+            gobject-introspection libgirepository1.0-dev
+
+      - name: Configure with Meson
+        run: |
+          meson setup builddir \
+            --prefix=/usr \
+            --libdir=lib \
+            -Dbuildtype=release \
+            -Db_lto=true \
+            -Db_pie=true
+
+      - name: Build
+        run: |
+          ninja -C builddir -j$(nproc)
+
+      - name: Create deb package
+        run: |
+          apt-get install -y debhelper dh-make
+          DESTDIR=/tmp/install ninja -C builddir install
+          cd /tmp/install && \
+          mkdir -p DEBIAN && \
+          cat > DEBIAN/control <<'EOF'
+          Package: hwphonelink
+          Version: 0.1.0
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Depends: libnl-3-200, libnl-genl-3-200, libglib2.0-0, hostapd, dnsmasq, iptables, iproute2, wireless-tools, iw, systemd
+          Maintainer: hwphonelink developers
+          Description: Huawei Multi-Screen Collaboration Transport Daemon
+          EOF
+          dpkg-deb --build /tmp/install /github/workspace/hwphonelink_0.1.0_amd64.deb
+
+      - name: Upload deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwphonelink_0.1.0_amd64.deb
+          path: /github/workspace/hwphonelink_0.1.0_amd64.deb
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y \
+            meson ninja-build gcc pkg-config \
+            libnl-3-dev libnl-genl-3-dev \
+            libglib2.0-dev libgio2.0-dev \
+            cppcheck clang-tidy
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=all --std=c11 --suppress=missingIncludeSystem src/ 2>&1 | tee cppcheck.log
+
+      - name: Run clang-tidy
+        run: |
+          meson setup builddir --prefix=/usr
+          ninja -C builddir compile_commands.json
+          run-clang-tidy.py -p builddir -header-filter=.* 2>&1 | tee clang-tidy.log
+
+  release:
+    name: Create Release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [build, build-debian]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

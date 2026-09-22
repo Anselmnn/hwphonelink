@@ -1,0 +1,31 @@
+[Unit]
+Description=Huawei Multi-Screen Collaboration Transport Daemon
+Documentation=https://github.com/your-repo/hwphonelink
+After=network-online.target wpa_supplicant.service NetworkManager.service
+Wants=network-online.target
+Requires=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/hwphonelinkd
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/hwphonelink /etc/hwphonelink
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+
+# Environment
+Environment=G_DEBUG=fatal-warnings
+
+[Install]
+WantedBy=multi-user.target
