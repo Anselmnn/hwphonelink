@@ -79,12 +79,13 @@ jobs:
         run: |
           apt-get update && apt-get install -y \
             meson ninja-build gcc pkg-config \
-            libnl-3-dev libnl-genl-3-dev \
+            libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
             libglib2.0-dev libgio2.0-dev \
             hostapd dnsmasq iptables iproute2 \
             wireless-tools iw \
             systemd libsystemd-dev \
-            gobject-introspection libgirepository1.0-dev
+            gobject-introspection libgirepository1.0-dev \
+            debhelper dpkg-dev
 
       - name: Configure with Meson
         run: |
@@ -101,27 +102,30 @@ jobs:
 
       - name: Create deb package
         run: |
-          apt-get install -y debhelper dh-make
           DESTDIR=/tmp/install ninja -C builddir install
           cd /tmp/install && \
           mkdir -p DEBIAN && \
           cat > DEBIAN/control <<'EOF'
           Package: hwphonelink
-          Version: 0.1.0
+          Version: ${{ github.ref_name }}
           Section: net
           Priority: optional
           Architecture: amd64
-          Depends: libnl-3-200, libnl-genl-3-200, libglib2.0-0, hostapd, dnsmasq, iptables, iproute2, wireless-tools, iw, systemd
-          Maintainer: hwphonelink developers
+          Depends: libnl-3-200, libnl-genl-3-200, libnl-route-3-200, libglib2.0-0, libgio-2.0-0, libgobject-2.0-0, hostapd, dnsmasq, iptables, iproute2, wireless-tools, iw, systemd, dbus
+          Maintainer: hwphonelink developers <dev@hwphonelink.local>
           Description: Huawei Multi-Screen Collaboration Transport Daemon
+           Provides Wi-Fi transport layer for Huawei Multi-Screen Collaboration
+           (多屏协同) on Linux. Implements dual-stack SoftAP (hostapd) + P2P-GO
+           (wpa_supplicant) with concurrent STA+AP support. Validated on
+           RTL8822CE/rtw88.
           EOF
-          dpkg-deb --build /tmp/install /github/workspace/hwphonelink_0.1.0_amd64.deb
+          dpkg-deb --build /tmp/install /github/workspace/hwphonelink_${{ github.ref_name }}_amd64.deb
 
       - name: Upload deb package
         uses: actions/upload-artifact@v4
         with:
-          name: hwphonelink_0.1.0_amd64.deb
-          path: /github/workspace/hwphonelink_0.1.0_amd64.deb
+          name: hwphonelink_${{ github.ref_name }}_amd64.deb
+          path: /github/workspace/hwphonelink_${{ github.ref_name }}_amd64.deb
 
   static-analysis:
     name: Static Analysis
