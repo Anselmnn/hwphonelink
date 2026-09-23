@@ -18,8 +18,9 @@
 #define HWPHONELINK_FALLBACK_CHANNEL 1  /* 2.4G fallback */
 
 typedef enum {
-  HWPHONELINK_TRANSPORT_SOFTAP = 0,  /* hostapd + dnsmasq (primary) */
-  HWPHONELINK_TRANSPORT_P2P_GO = 1,  /* wpa_supplicant P2P-GO (fallback) */
+  HWPHONELINK_TRANSPORT_SOFTAP = 0,   /* hostapd + dnsmasq (primary) */
+  HWPHONELINK_TRANSPORT_P2P_GO = 1,   /* wpa_supplicant P2P-GO (fallback) */
+  HWPHONELINK_TRANSPORT_INFRA = 2,    /* LAN/Wi-Fi/Ethernet (infrastructure) */
 } HwPhoneLinkTransportType;
 
 typedef enum {
@@ -47,6 +48,8 @@ struct _HwPhoneLinkTransportClass {
 
 #define HWPHONELINK_TYPE_TRANSPORT (hw_phone_link_transport_get_type())
 G_DECLARE_DERIVABLE_TYPE(HwPhoneLinkTransport, hw_phone_link_transport, HWPHONELINK, TRANSPORT, GObject)
+
+HwPhoneLinkTransport* hw_phone_link_infra_backend_new(const gchar *interface, GError **error);
 
 /* Factory */
 HwPhoneLinkTransport* hw_phone_link_transport_new(HwPhoneLinkTransportType type,

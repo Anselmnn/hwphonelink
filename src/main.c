@@ -72,11 +72,13 @@ int main(int argc, char *argv[]) {
   gchar *phy_name = "phy0";
   gchar *sta_interface = "wlp1s0";
   gboolean use_p2p_fallback = FALSE;
+  gboolean use_infra = FALSE;
 
   GOptionEntry entries[] = {
     {"phy", 'p', 0, G_OPTION_ARG_STRING, &phy_name, "Physical interface name (e.g., phy0)", "PHY"},
     {"interface", 'i', 0, G_OPTION_ARG_STRING, &sta_interface, "Station interface name (e.g., wlp1s0)", "IFACE"},
     {"p2p-fallback", 'f', 0, G_OPTION_ARG_NONE, &use_p2p_fallback, "Use P2P-GO fallback instead of SoftAP", NULL},
+    {"infra", 'n', 0, G_OPTION_ARG_NONE, &use_infra, "Use Infrastructure mode (LAN/Wi-Fi/Ethernet) instead of SoftAP", NULL},
     {NULL}
   };
 
@@ -88,10 +90,14 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Check root
+  // Check root (not required for infrastructure mode — no AP/virtif creation)
   if (geteuid() != 0) {
-    g_printerr("This program must be run as root\n");
-    return 1;
+    if (!use_infra) {
+      g_printerr("This program must be run as root (SoftAP/P2P modes need "
+                 "interface management). Hint: use --infra for plain LAN mode.\n");
+      return 1;
+    }
+    g_print("Running without root (infra mode)\n");
   }
 
   // Setup signals
@@ -99,7 +105,10 @@ int main(int argc, char *argv[]) {
   signal(SIGTERM, signal_handler);
 
   // Create transport
-  if (use_p2p_fallback) {
+  if (use_infra) {
+    g_print("Using Infrastructure transport (LAN)...\n");
+    transport = hw_phone_link_infra_backend_new(sta_interface, &error);
+  } else if (use_p2p_fallback) {
     g_print("Using P2P-GO fallback transport...\n");
     transport = hw_phone_link_p2p_backend_new(phy_name, sta_interface, &error);
   } else {

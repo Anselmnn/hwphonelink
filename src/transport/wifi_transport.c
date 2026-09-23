@@ -7,6 +7,7 @@
 #include "wifi_transport.h"
 #include "softap_backend.h"
 #include "p2p_backend.h"
+#include "infra_backend.h"
 
 GType hw_phone_link_state_get_type(void) {
   static GType type = 0;
@@ -104,7 +105,7 @@ static void hw_phone_link_transport_class_init(HwPhoneLinkTransportClass *klass)
                0, NULL, NULL,
                NULL,
                G_TYPE_NONE, 2,
-               G_TYPE_ENUM, G_TYPE_ENUM);
+               HWPHONELINK_TYPE_STATE, HWPHONELINK_TYPE_STATE);
 
   g_signal_new("client-connected",
                G_TYPE_FROM_CLASS(klass),
@@ -166,6 +167,8 @@ HwPhoneLinkTransport* hw_phone_link_transport_new(HwPhoneLinkTransportType type,
       return hw_phone_link_softap_backend_new(phy_name, sta_interface, error);
     case HWPHONELINK_TRANSPORT_P2P_GO:
       return hw_phone_link_p2p_backend_new(phy_name, sta_interface, error);
+    case HWPHONELINK_TRANSPORT_INFRA:
+      return hw_phone_link_infra_backend_new(sta_interface, error);
     default:
       g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
                   "Unknown transport type: %d", type);

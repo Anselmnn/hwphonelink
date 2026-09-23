@@ -47,6 +47,7 @@ transport_sources = [
   'src/transport/wifi_transport.c',
   'src/transport/softap_backend.c',
   'src/transport/p2p_backend.c',
+  'src/transport/infra_backend.c',
   'src/transport/netlink_utils.c',
 ]
 
