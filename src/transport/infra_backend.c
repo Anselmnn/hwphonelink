@@ -11,6 +11,7 @@
 
 #include "infra_backend.h"
 #include "netlink_utils.h"
+#include "proto/softbus_session.h"
 
 #include <glib.h>
 #include <gio/gio.h>
@@ -40,6 +41,11 @@ typedef struct {
   gint running;            /* atomic: 1 while worker loops are active */
   GMutex state_mutex;
   HwPhoneLinkState state;
+
+  /* Open dsoftbus sessions (one per accepted TCP connection). The backend
+   * owns one ref per session; the session's closed callback removes it. */
+  GList *sessions;
+  GMutex sessions_mutex;
 } HwPhoneLinkInfraBackendPrivate;
 
 G_DEFINE_TYPE_WITH_PRIVATE(HwPhoneLinkInfraBackend, hw_phone_link_infra_backend, HWPHONELINK_TYPE_TRANSPORT)
@@ -61,13 +67,69 @@ static guint hw_phone_link_infra_backend_get_ap_channel(HwPhoneLinkTransport *se
 
 static void _stop_listeners(HwPhoneLinkInfraBackend *self);
 
+/*
+ * Session closed (peer disconnected, read error, or stop): drop it from the
+ * list and release the backend's ref. Called from the session pump thread
+ * (the pump holds a temporary ref across the call, so unrefing here is safe
+ * even if it destroys the session).
+ *
+ * List membership is the ownership record: we unref only when the session
+ * is still listed. If shutdown moved the list to _release_sessions() first,
+ * that function owns the ref — unrefing here as well would double-free.
+ */
+static void _on_session_closed(SoftbusSession *session, gpointer user_data) {
+  HwPhoneLinkInfraBackend *self = HWPHONELINK_INFRA_BACKEND(user_data);
+  HwPhoneLinkInfraBackendPrivate *priv = _priv(self);
+
+  g_mutex_lock(&priv->sessions_mutex);
+  if (g_list_find(priv->sessions, session) != NULL) {
+    priv->sessions = g_list_remove(priv->sessions, session);
+    g_object_unref(session);
+  }
+  g_mutex_unlock(&priv->sessions_mutex);
+
+  /*
+   * Tell the daemon the session went away. Fires exactly once per session
+   * (the pump emits closed once) and, on the shutdown path, from inside
+   * stop()'s join — both before the session's last ref is dropped, so
+   * handlers may use the pointer per the signal contract.
+   */
+  g_signal_emit_by_name(HWPHONELINK_TRANSPORT(self), "session-closed", session);
+}
+
+/*
+ * Release all still-open sessions (finalize path — stop() already ran or
+ * the object is being torn down). Move the whole list out under the mutex:
+ * each element is one backend ref that we take over here. Sessions whose
+ * closed callback already ran (peer went away before shutdown) are no
+ * longer listed and must not be touched again.
+ */
+static void _release_sessions(HwPhoneLinkInfraBackend *self) {
+  HwPhoneLinkInfraBackendPrivate *priv = _priv(self);
+  g_mutex_lock(&priv->sessions_mutex);
+  GList *sessions = priv->sessions;
+  priv->sessions = NULL;
+  g_mutex_unlock(&priv->sessions_mutex);
+
+  for (GList *l = sessions; l; l = l->next) {
+    SoftbusSession *s = SOFTBUS_SESSION(l->data);
+    /* stop() joins the pump; the closed callback may fire in between but
+     * finds the session unlisted, so it won't double-unref. */
+    softbus_session_stop(s);
+    g_object_unref(s);
+  }
+  g_list_free(sessions);
+}
+
 static void hw_phone_link_infra_backend_finalize(GObject *object) {
   HwPhoneLinkInfraBackend *self = HWPHONELINK_INFRA_BACKEND(object);
   HwPhoneLinkInfraBackendPrivate *priv = _priv(self);
   if (g_atomic_int_get(&priv->running)) {
     _stop_listeners(self);
   }
+  _release_sessions(self);
   g_mutex_clear(&priv->state_mutex);
+  g_mutex_clear(&priv->sessions_mutex);
   if (priv->worker_cancel) g_object_unref(priv->worker_cancel);
   if (priv->nl_handle) hw_phone_link_nl_handle_free(priv->nl_handle);
   g_free(priv->config.interface);
@@ -94,6 +156,7 @@ static void hw_phone_link_infra_backend_class_init(HwPhoneLinkInfraBackendClass 
 static void hw_phone_link_infra_backend_init(HwPhoneLinkInfraBackend *self) {
   HwPhoneLinkInfraBackendPrivate *priv = _priv(self);
   g_mutex_init(&priv->state_mutex);
+  g_mutex_init(&priv->sessions_mutex);
   priv->state = HWPHONELINK_STATE_STOPPED;
 
   priv->config.interface = g_strdup("wlp1s0");
@@ -187,6 +250,7 @@ static void* _tcp_accept_loop(gpointer data) {
                                                        &source_object,
                                                        priv->worker_cancel, &err);
     if (conn) {
+      gchar *peer_ip = NULL;
       GError *addr_err = NULL;
       GSocketAddress *remote = g_socket_connection_get_remote_address(G_SOCKET_CONNECTION(conn), &addr_err);
       if (addr_err) {
@@ -196,14 +260,32 @@ static void* _tcp_accept_loop(gpointer data) {
       if (remote) {
         GInetAddress *inet = g_inet_socket_address_get_address(G_INET_SOCKET_ADDRESS(remote));
         guint port = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(remote));
-        gchar *peer_ip = inet ? g_inet_address_to_string(inet) : NULL;
+        peer_ip = inet ? g_inet_address_to_string(inet) : NULL;
         g_print("Infra: Incoming TCP connection from %s:%u\n", peer_ip ? peer_ip : "?", port);
-        g_free(peer_ip);
         g_object_unref(remote);
       }
-      /* TODO(M2): hand the connection to the dsoftbus session layer
-       *           (auth handshake → session). For now drop it. */
-      g_object_unref(conn);
+
+      /*
+       * Wrap the connection in a dsoftbus session (TLV frame pump +
+       * serialized writes) and hand it to the daemon via "session-opened".
+       * The backend keeps one ref until the session closes.
+       */
+      SoftbusSession *session = softbus_session_new(G_SOCKET_CONNECTION(conn),
+                                                    SOFTBUS_SESSION_MESSAGE);
+      g_object_unref(conn);  /* the session holds its own ref on conn */
+      if (session) {
+        softbus_session_set_closed_cb(session, _on_session_closed, self);
+        g_mutex_lock(&priv->sessions_mutex);
+        priv->sessions = g_list_append(priv->sessions, session);
+        g_mutex_unlock(&priv->sessions_mutex);
+        g_signal_emit_by_name(HWPHONELINK_TRANSPORT(self),
+                              "client-connected", "", peer_ip);
+        g_signal_emit_by_name(HWPHONELINK_TRANSPORT(self),
+                              "session-opened", session, peer_ip);
+      } else {
+        g_print("Infra: Failed to create dsoftbus session, dropping connection\n");
+      }
+      g_free(peer_ip);
     } else if (err) {
       if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
         g_clear_error(&err);
@@ -419,6 +501,17 @@ static gboolean hw_phone_link_infra_backend_stop(HwPhoneLinkTransport *transport
     g_object_unref(priv->tcp_listener);
     priv->tcp_listener = NULL;
   }
+
+  /* Close all open sessions. stop() joins the pump, whose closed callback
+   * removes each session from the list and releases the backend ref. */
+  g_mutex_lock(&priv->sessions_mutex);
+  GList *sessions = g_list_copy(priv->sessions);
+  priv->sessions = NULL;
+  g_mutex_unlock(&priv->sessions_mutex);
+  for (GList *l = sessions; l; l = l->next) {
+    softbus_session_stop(SOFTBUS_SESSION(l->data));
+  }
+  g_list_free(sessions);
 
   _set_state(self, HWPHONELINK_STATE_STOPPED);
   return TRUE;

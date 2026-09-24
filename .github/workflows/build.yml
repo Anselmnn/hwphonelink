@@ -29,7 +29,8 @@ jobs:
         run: |
           apt-get update && apt-get install -y \
             meson ninja-build gcc pkg-config \
-            libnl-3-dev libnl-genl-3-dev \
+            libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
+            libjson-glib-dev libssl-dev \
             libglib2.0-dev libgio2.0-dev \
             hostapd dnsmasq iptables iproute2 \
             wireless-tools iw \
@@ -80,6 +81,7 @@ jobs:
           apt-get update && apt-get install -y \
             meson ninja-build gcc pkg-config \
             libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
+            libjson-glib-dev libssl-dev \
             libglib2.0-dev libgio2.0-dev \
             hostapd dnsmasq iptables iproute2 \
             wireless-tools iw \
@@ -111,7 +113,7 @@ jobs:
           Section: net
           Priority: optional
           Architecture: amd64
-          Depends: libnl-3-200, libnl-genl-3-200, libnl-route-3-200, libglib2.0-0, libgio-2.0-0, libgobject-2.0-0, hostapd, dnsmasq, iptables, iproute2, wireless-tools, iw, systemd, dbus
+          Depends: libnl-3-200, libnl-genl-3-200, libnl-route-3-200, libglib2.0-0, libgio-2.0-0, libgobject-2.0-0, libjson-glib-1.0-0, libssl3t64 | libssl3, hostapd, dnsmasq, iptables, iproute2, wireless-tools, iw, systemd, dbus
           Maintainer: hwphonelink developers <dev@hwphonelink.local>
           Description: Huawei Multi-Screen Collaboration Transport Daemon
            Provides Wi-Fi transport layer for Huawei Multi-Screen Collaboration
@@ -141,7 +143,8 @@ jobs:
         run: |
           apt-get update && apt-get install -y \
             meson ninja-build gcc pkg-config \
-            libnl-3-dev libnl-genl-3-dev \
+            libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
+            libjson-glib-dev libssl-dev \
             libglib2.0-dev libgio2.0-dev \
             cppcheck clang-tidy
 

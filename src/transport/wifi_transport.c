@@ -122,6 +122,29 @@ static void hw_phone_link_transport_class_init(HwPhoneLinkTransportClass *klass)
                NULL,
                G_TYPE_NONE, 1,
                G_TYPE_STRING);
+
+  /*
+   * dsoftbus session signals (M2). The first parameter is a
+   * SoftbusSession* (see proto/softbus_session.h) passed as a raw pointer.
+   * The transport keeps the session alive (it owns a ref) until the peer
+   * disconnects or the transport stops, so handlers may use the pointer
+   * without taking their own ref.
+   */
+  g_signal_new("session-opened",
+               G_TYPE_FROM_CLASS(klass),
+               G_SIGNAL_RUN_LAST,
+               0, NULL, NULL,
+               NULL,
+               G_TYPE_NONE, 2,
+               G_TYPE_POINTER, G_TYPE_STRING);
+
+  g_signal_new("session-closed",
+               G_TYPE_FROM_CLASS(klass),
+               G_SIGNAL_RUN_LAST,
+               0, NULL, NULL,
+               NULL,
+               G_TYPE_NONE, 1,
+               G_TYPE_POINTER);
 }
 
 static void hw_phone_link_transport_init(HwPhoneLinkTransport *self) {

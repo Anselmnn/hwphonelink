@@ -48,14 +48,6 @@ static void hw_phone_link_softap_backend_finalize(GObject *object) {
   G_OBJECT_CLASS(hw_phone_link_softap_backend_parent_class)->finalize(object);
 }
 
-static HwPhoneLinkSoftapConfig* _config(HwPhoneLinkSoftapBackend *self) {
-  return &_priv(self)->config;
-}
-
-static HwPhoneLinkNlHandle* _nl_handle(HwPhoneLinkSoftapBackend *self) {
-  return _priv(self)->nl_handle;
-}
-
 static gboolean _ensure_dirs(const HwPhoneLinkSoftapConfig *config, GError **error) {
   if (g_mkdir_with_parents(config->run_dir, 0755) < 0) {
     g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED,

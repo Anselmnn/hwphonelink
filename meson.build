@@ -14,6 +14,8 @@ dep_libnl_route = dependency('libnl-route-3.0', required: true)
 dep_glib = dependency('glib-2.0', required: true)
 dep_gio = dependency('gio-2.0', required: true)
 dep_gobject = dependency('gobject-2.0', required: true)
+dep_json_glib = dependency('json-glib-1.0', required: true)
+dep_openssl = dependency('openssl', required: true)
 
 # Threads
 thread_dep = dependency('threads')
@@ -22,8 +24,6 @@ thread_dep = dependency('threads')
 add_project_arguments([
   '-D_GNU_SOURCE',
   '-DFILE_OFFSET_BITS=64',
-  '-Wall',
-  '-Wextra',
   '-Wno-unused-parameter',
 ], language: 'c')
 
@@ -40,7 +40,34 @@ headers = [
   'src/transport/softap_backend.h',
   'src/transport/p2p_backend.h',
   'src/transport/netlink_utils.h',
+  'src/proto/softbus_defs.h',
+  'src/proto/softbus_frame.h',
+  'src/proto/softbus_device.h',
+  'src/proto/softbus_crypto.h',
+  'src/proto/softbus_auth.h',
+  'src/proto/softbus_session.h',
 ]
+
+inc = include_directories('src')
+
+# dsoftbus protocol core (M2): frame codec, discovery beacon, crypto,
+# HiChain auth FSM, session layer.
+proto_sources = [
+  'src/proto/softbus_frame.c',
+  'src/proto/softbus_device.c',
+  'src/proto/softbus_crypto.c',
+  'src/proto/softbus_auth.c',
+  'src/proto/softbus_session.c',
+]
+
+proto_lib = library(
+  'hwphonelink-proto',
+  proto_sources,
+  include_directories: inc,
+  dependencies: [dep_glib, dep_gio, dep_gobject, dep_json_glib, dep_openssl, thread_dep],
+  install: true,
+  install_dir: libdir,
+)
 
 # Core transport library
 transport_sources = [
@@ -54,7 +81,8 @@ transport_sources = [
 transport_lib = library(
   'hwphonelink-transport',
   transport_sources,
-  include_directories: include_directories('src'),
+  include_directories: inc,
+  link_with: proto_lib,
   dependencies: [dep_libnl3, dep_libnl_genl, dep_libnl_route, dep_glib, dep_gio, dep_gobject, thread_dep],
   install: true,
   install_dir: libdir,
@@ -65,14 +93,37 @@ daemon_sources = [
   'src/main.c',
 ]
 
-inc = include_directories('src')
-
 daemon = executable(
   'hwphonelinkd',
   daemon_sources,
-  link_with: transport_lib,
+  link_with: [transport_lib, proto_lib],
   include_directories: inc,
   dependencies: [dep_libnl3, dep_libnl_genl, dep_glib, dep_gio, dep_gobject, thread_dep],
+  install: true,
+  install_dir: bindir,
+)
+
+# ============================ Tests (M2) ============================
+
+# Protocol core unit tests (frame codec, beacon, crypto, auth FSM, session).
+# No network needed — runs in CI via `ninja test`.
+proto_test = executable(
+  'hwphonelink-proto-test',
+  'tests/proto_test.c',
+  link_with: proto_lib,
+  include_directories: inc,
+  dependencies: [dep_glib, dep_gio, thread_dep],
+)
+test('proto', proto_test)
+
+# Replay-stand mock phone: CoAP beacon + PSK auth + session echo over TCP.
+# Manual e2e target: run the daemon (--infra) and this binary against it.
+mock_phone = executable(
+  'hwphonelink-mock-phone',
+  'tests/mock_phone.c',
+  link_with: proto_lib,
+  include_directories: inc,
+  dependencies: [dep_glib, dep_gio, thread_dep],
   install: true,
   install_dir: bindir,
 )
@@ -132,8 +183,10 @@ summary = {
   'Project': meson.project_name(),
   'Version': meson.project_version(),
   'Prefix': prefix,
+  'Proto library': 'libhwphonelink-proto.so',
   'Transport library': 'libhwphonelink-transport.so',
   'Daemon': 'hwphonelinkd',
+  'Mock phone': 'hwphonelink-mock-phone',
   'Config dir': join_paths(sysconfdir, 'hwphonelink'),
 }
 
