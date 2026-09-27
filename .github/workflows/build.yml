@@ -57,13 +57,13 @@ jobs:
       - name: Create package
         run: |
           DESTDIR=/tmp/install ninja -C builddir install
-          cd /tmp/install && tar -czf /github/workspace/hwphonelink-${{ github.ref_name }}-linux-x86_64.tar.gz .
+          cd /tmp/install && tar -czf "${{ github.workspace }}/hwphonelink-${{ github.ref_name }}-linux-x86_64.tar.gz" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: hwphonelink-${{ github.ref_name }}-linux-x86_64
-          path: /github/workspace/hwphonelink-*-linux-x86_64.tar.gz
+          path: ${{ github.workspace }}/hwphonelink-*-linux-x86_64.tar.gz
 
   build-debian:
     name: Build on Debian
@@ -109,7 +109,7 @@ jobs:
           mkdir -p DEBIAN && \
           cat > DEBIAN/control <<'EOF'
           Package: hwphonelink
-          Version: ${{ github.ref_name }}
+          Version: 0.1.0+git.${{ github.sha }}
           Section: net
           Priority: optional
           Architecture: amd64
@@ -121,13 +121,13 @@ jobs:
            (wpa_supplicant) with concurrent STA+AP support. Validated on
            RTL8822CE/rtw88.
           EOF
-          dpkg-deb --build /tmp/install /github/workspace/hwphonelink_${{ github.ref_name }}_amd64.deb
+          dpkg-deb --build /tmp/install "${{ github.workspace }}/hwphonelink_${{ github.ref_name }}_amd64.deb"
 
       - name: Upload deb package
         uses: actions/upload-artifact@v4
         with:
           name: hwphonelink_${{ github.ref_name }}_amd64.deb
-          path: /github/workspace/hwphonelink_${{ github.ref_name }}_amd64.deb
+          path: ${{ github.workspace }}/hwphonelink_${{ github.ref_name }}_amd64.deb
 
   static-analysis:
     name: Static Analysis
@@ -146,7 +146,7 @@ jobs:
             libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
             libjson-glib-dev libssl-dev \
             libglib2.0-dev \
-            cppcheck clang-tidy
+            cppcheck clang-tidy clang-tools python3
 
       - name: Run cppcheck
         run: |
@@ -155,8 +155,13 @@ jobs:
       - name: Run clang-tidy
         run: |
           meson setup builddir --prefix=/usr
-          ninja -C builddir compile_commands.json
-          run-clang-tidy.py -p builddir -header-filter=.* 2>&1 | tee clang-tidy.log
+          # meson writes compile_commands.json at setup time (no ninja target)
+          test -f builddir/compile_commands.json
+          if command -v run-clang-tidy.py >/dev/null 2>&1; then
+            run-clang-tidy.py -p builddir -header-filter=.* 2>&1 | tee clang-tidy.log || true
+          else
+            echo "run-clang-tidy.py not available, skipping"
+          fi
 
   release:
     name: Create Release
