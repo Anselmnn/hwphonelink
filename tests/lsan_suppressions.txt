@@ -1,0 +1,5 @@
+# LSan suppressions for hwphonelink ASan runs.
+#
+# GLib 2.84.4 leaks a small g_locale_to_utf8() buffer inside
+# g_option_context_parse() (library-internal, not project code).
+leak:g_option_context_parse

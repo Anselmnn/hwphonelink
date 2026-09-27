@@ -9,8 +9,12 @@
  *   3. Runs the HiChain 4-state auth FSM as the PASSIVE side in PSK mode.
  *   4. On success, sends a "P40-PING" payload and verifies the daemon's
  *      echo — validating the session data path end to end.
+ *   5. Opens a raw-TCP DFile connection to the daemon, pushes a
+ *      deterministic test file (ft-<sha>.bin, verified by the daemon)
+ *      and receives the daemon's reverse push (verified by the engine
+ *      from the wire name) — bidirectional E2E. Skippable with --no-ft.
  *
- * Exit codes: 0 = full handshake + echo OK, 1 = failure/timeout.
+ * Exit codes: 0 = full handshake + echo + FT OK, 1 = failure/timeout.
  */
 
 #include <glib.h>
@@ -27,14 +31,28 @@
 #include "proto/softbus_auth.h"
 #include "proto/softbus_session.h"
 #include "proto/softbus_crypto.h"
+#include "proto/dfile_conn.h"
+#include "proto/ft_testfile.h"
 
 #define MOCK_PING "P40-PING"
-#define MOCK_TIMEOUT_MS 15000
+#define MOCK_TIMEOUT_MS 45000
+#define MOCK_FT_SEED 1
+#define MOCK_FT_SIZE (1024 * 1024) /* 1 MiB = 713 blocks @ 1472, last 512 */
 
 static GMainLoop *loop = NULL;
 static gint exit_code = 1;
 static SoftbusSession *session = NULL;
 static SoftbusAuth *auth = NULL;
+
+/* DFile phase state. The push is started from the engine thread
+ * (on_ft_negotiated); results/closure fire there too and are marshalled
+ * to the main loop with g_main_context_invoke. */
+static DFileConn *ft_dc = NULL;
+static volatile gint ft_push_done = 0;
+static volatile gint ft_pull_done = 0;
+static volatile gint ft_finished = 0;
+static guint ft_port = 54322;
+static gboolean skip_ft = FALSE;
 
 /* Runs on the main thread (either directly from the timeout source, or
  * via g_main_context_invoke from the session pump thread). GSourceFunc. */
@@ -60,17 +78,140 @@ static void print_keys(const gchar *who) {
   }
 }
 
+/* ============================ DFile phase ============================
+ *
+ * After the echo check the mock opens a raw-TCP DFile client connection
+ * to the daemon (proto/dfile_conn.h), pushes a deterministic test file
+ * (ft-<sha256>.bin) and receives the daemon's reverse push. The wire
+ * name convention lets the receiver verify content without extra
+ * metadata.
+ *
+ * Engine callbacks fire on the DFile engine thread; they only marshal
+ * to the main loop via g_main_context_invoke().
+ */
+
+/* Marshalled: print + fail with @msg (takes ownership of the string). */
+static int ft_fail(gpointer msg) {
+  g_print("mock-phone: FT FAILED: %s\n", (const gchar *)msg);
+  g_free(msg);
+  return set_exit(GINT_TO_POINTER(1));
+}
+
+static void ft_fail_invoke(const gchar *reason) {
+  g_main_context_invoke_full(NULL, G_PRIORITY_DEFAULT, (GSourceFunc)ft_fail,
+                             g_strdup(reason), NULL);
+}
+
+/* Both directions verified → exit 0 (exactly once). */
+static int ft_mark_done(gpointer p) {
+  (void)p;
+  if (g_atomic_int_exchange(&ft_finished, 1)) return 0;
+  g_print("mock-phone: FT E2E OK (push + pull verified)\n");
+  return set_exit(GINT_TO_POINTER(0));
+}
+
+static void on_ft_negotiated(DFileConn *dc, gpointer user_data) {
+  (void)user_data;
+  g_print("mock-phone: DFile session negotiated (block size %u)\n",
+          dfile_conn_block_size(dc));
+
+  /* Push file A: deterministic test content, self-describing name. */
+  gchar *dir = g_build_filename(g_get_tmp_dir(), "hwphonelink-mock-ft",
+                                NULL);
+  gchar *path = NULL;
+  gchar *wire_name = NULL;
+  if (g_mkdir_with_parents(dir, 0755) < 0 ||
+      !ft_testfile_generate(dir, MOCK_FT_SEED, MOCK_FT_SIZE, &path,
+                            &wire_name)) {
+    g_print("mock-phone: test file generation failed\n");
+    g_free(dir);
+    ft_fail_invoke("cannot generate test file");
+    return;
+  }
+  g_print("mock-phone: pushing %s (%u bytes)\n", wire_name,
+          (unsigned)MOCK_FT_SIZE);
+  DFileSendItem item = {path, wire_name, 0};
+  GError *err = NULL;
+  if (!dfile_conn_send_files(dc, &item, 1, &err)) {
+    g_print("mock-phone: push start failed: %s\n", err ? err->message : "?");
+    g_clear_error(&err);
+    ft_fail_invoke("push start failed");
+  }
+  g_free(path);
+  g_free(wire_name);
+  g_free(dir);
+}
+
+static void on_ft_file_list(DFileConn *dc, const DFileHeaderEntry *entries,
+                            gsize n, gpointer user_data) {
+  (void)dc;
+  (void)user_data;
+  for (gsize i = 0; i < n; i++)
+    g_print("mock-phone: incoming file %u: %s (%" G_GUINT64_FORMAT
+            " bytes)\n", (unsigned)entries[i].file_id, entries[i].name,
+            entries[i].file_size);
+}
+
+static void on_ft_result(DFileConn *dc, gboolean is_sender, gboolean ok,
+                         const gchar *msg, gpointer user_data) {
+  (void)dc;
+  (void)user_data;
+  if (!ok) {
+    ft_fail_invoke(msg);
+    return;
+  }
+  g_print("mock-phone: FT %s done: %s\n", is_sender ? "push" : "pull", msg);
+  if (is_sender)
+    g_atomic_int_set(&ft_push_done, 1);
+  else
+    g_atomic_int_set(&ft_pull_done, 1);
+  if (ft_push_done && ft_pull_done)
+    g_main_context_invoke(NULL, ft_mark_done, NULL);
+}
+
+static void on_ft_closed(DFileConn *dc, gpointer user_data) {
+  (void)dc;
+  (void)user_data;
+  g_print("mock-phone: DFile session closed\n");
+  if (!(ft_push_done && ft_pull_done))
+    ft_fail_invoke("FT session closed before both transfers completed");
+  /* The mock keeps its external ref until main() cleanup. */
+}
+
+/* Called on the session pump thread after the echo check. A blocking
+ * connect here is fine — the daemon's FT listener is already up. */
+static void start_ft(const gchar *server_ip) {
+  GError *err = NULL;
+  DFileConn *dc = dfile_conn_new_client(server_ip, ft_port, &err);
+  if (dc == NULL) {
+    g_print("mock-phone: DFile connect failed: %s\n",
+            err ? err->message : "?");
+    g_clear_error(&err);
+    ft_fail_invoke("DFile connect failed");
+    return;
+  }
+  gchar *rxdir = g_build_filename(g_get_tmp_dir(), "hwphonelink-mock-ft-rx",
+                                  NULL);
+  g_mkdir_with_parents(rxdir, 0755);
+  dfile_conn_set_recv_dir(dc, rxdir);
+  g_free(rxdir);
+  dfile_conn_set_callbacks(dc, on_ft_negotiated, on_ft_file_list,
+                           on_ft_result, on_ft_closed, NULL);
+  ft_dc = dc;
+}
+
 /* Session data callback (pump thread). */
 static void on_data(SoftbusSession *s, const guint8 *data, gsize len,
                     gpointer user_data) {
-  (void)user_data;
-
   if (softbus_auth_get_state(auth) == SOFTBUS_AUTH_STATE_DONE) {
     /* Post-auth: the daemon echoes payloads. Our ping must come back. */
     if (len == strlen(MOCK_PING) && memcmp(data, MOCK_PING, len) == 0) {
       g_print("mock-phone: echo of %s received — session data path OK\n",
               MOCK_PING);
-      g_main_context_invoke(NULL, set_exit, GINT_TO_POINTER(0));
+      if (skip_ft)
+        g_main_context_invoke(NULL, set_exit, GINT_TO_POINTER(0));
+      else
+        start_ft((const gchar *)user_data);
     }
     return;
   }
@@ -176,12 +317,15 @@ int main(int argc, char *argv[]) {
 
   gchar *server_ip = NULL;
   guint server_port = 54321;
+  gint ft_port_opt = 54322;
   gchar *psk = NULL;
   gchar *device_id = "mock-phone-001";
 
   GOptionEntry entries[] = {
     {"server-ip", 0, 0, G_OPTION_ARG_STRING, &server_ip, "Daemon IP to connect to", "IP"},
     {"server-port", 0, 0, G_OPTION_ARG_INT, &server_port, "Daemon session TCP port (default 54321)", "PORT"},
+    {"ft-port", 0, 0, G_OPTION_ARG_INT, &ft_port_opt, "Daemon DFile (file transfer) TCP port (default 54322)", "PORT"},
+    {"no-ft", 0, G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE, &skip_ft, "Skip the DFile transfer phase (session test only)", NULL},
     {"psk", 0, 0, G_OPTION_ARG_STRING, &psk, "Pre-provisioned PSK (default: test PSK)", "SECRET"},
     {"id", 0, 0, G_OPTION_ARG_STRING, &device_id, "Mock phone device id", "ID"},
     {NULL}
@@ -198,6 +342,11 @@ int main(int argc, char *argv[]) {
     g_printerr("%s", g_option_context_get_help(context, TRUE, NULL));
     return 1;
   }
+  if (ft_port_opt < 0) {
+    g_printerr("--ft-port must be >= 0\n");
+    return 1;
+  }
+  ft_port = (guint)ft_port_opt;
   if (psk == NULL) {
     psk = g_strdup(g_getenv("HWPONELINK_PSK"));
     if (psk == NULL || psk[0] == '\0') {
@@ -218,7 +367,9 @@ int main(int argc, char *argv[]) {
   dev->proxy_port = 45680;
   dev->ble_mac = g_strdup("aa:bb:cc:dd:ee:ff");
 
-  g_print("mock-phone: %s\n", softbus_device_to_string(dev));
+  gchar *dstr = softbus_device_to_string(dev);
+  g_print("mock-phone: %s\n", dstr);
+  g_free(dstr);
 
   /* 2. Publish the discovery beacon. */
   send_beacon(dev, server_ip);
@@ -258,7 +409,8 @@ int main(int argc, char *argv[]) {
   g_object_unref(conn);  /* the session owns its ref */
 
   auth = softbus_auth_new(dev, NULL, (const guint8 *)psk, strlen(psk));
-  softbus_session_set_data_cb(session, on_data, NULL, NULL);
+  /* user_data carries the daemon IP for the post-echo DFile phase. */
+  softbus_session_set_data_cb(session, on_data, (gpointer)server_ip, NULL);
 
   /* 5. Main loop (timeout guards the whole handshake). */
   loop = g_main_loop_new(NULL, FALSE);
@@ -267,6 +419,11 @@ int main(int argc, char *argv[]) {
 
   /* Cleanup */
   g_print("mock-phone: exiting with code %d\n", exit_code);
+  if (ft_dc) {
+    dfile_conn_close(ft_dc);
+    dfile_conn_unref(ft_dc);
+    ft_dc = NULL;
+  }
   softbus_session_stop(session);
   g_object_unref(session);
   softbus_auth_free(auth);

@@ -359,8 +359,9 @@ static gboolean _start_coap_listener(HwPhoneLinkInfraBackend *self, GError **err
   setsockopt(g_socket_get_fd(priv->coap_socket), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   setsockopt(g_socket_get_fd(priv->coap_socket), SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
 
-  GSocketAddress *bind_addr = g_inet_socket_address_new(
-      g_inet_address_new_from_string("0.0.0.0"), priv->config.coap_port);
+  GInetAddress *any = g_inet_address_new_from_string("0.0.0.0");
+  GSocketAddress *bind_addr = g_inet_socket_address_new(any, priv->config.coap_port);
+  g_object_unref(any); /* g_inet_socket_address_new() borrows only */
 
   if (!g_socket_bind(priv->coap_socket, bind_addr, TRUE, error)) {
     g_object_unref(bind_addr);

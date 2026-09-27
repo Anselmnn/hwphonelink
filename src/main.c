@@ -19,6 +19,8 @@
 #include "proto/softbus_auth.h"
 #include "proto/softbus_session.h"
 #include "proto/softbus_crypto.h"
+#include "proto/dfile_conn.h"
+#include "proto/ft_testfile.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <signal.h>
@@ -32,6 +34,13 @@ static HwPhoneLinkTransport *transport = NULL;
 /* Local identity + pre-provisioned PSK (PSK-mode auth, replay stand). */
 static SoftbusDevice *local_device = NULL;
 static gchar *psk = NULL;
+
+/* DFile (file transfer) listener: raw TCP, separate from the dsoftbus
+ * session connection. One DFileConn engine per accepted connection. */
+static GSocketService *ft_service = NULL;
+static gchar *ft_dir = NULL;
+static gchar *ft_send_spec = NULL;
+static guint ft_port = 0;
 
 static void signal_handler(int signum) {
   g_print("Received signal %d, shutting down...\n", signum);
@@ -189,6 +198,127 @@ static void on_session_closed(HwPhoneLinkTransport *t,
   g_print("Session closed\n");
 }
 
+/* ============================ DFile (file transfer) ============================
+ *
+ * Raw-TCP DFile engine (proto/dfile_conn.h). When the peer pushes a file
+ * list we immediately start a reverse send (bidirectional on the same
+ * connection), so the replay stand verifies both directions.
+ *
+ * All callbacks below run on the DFileConn engine thread.
+ */
+
+typedef struct {
+  gboolean sent_back;
+} FtSession;
+
+static void on_ft_negotiated(DFileConn *dc, gpointer user_data) {
+  (void)user_data;
+  g_print("FT: DFile session negotiated (block size %u)\n",
+          dfile_conn_block_size(dc));
+}
+
+static void on_ft_file_list(DFileConn *dc, const DFileHeaderEntry *entries,
+                            gsize n, gpointer user_data) {
+  FtSession *s = (FtSession *)user_data;
+  for (gsize i = 0; i < n; i++)
+    g_print("FT: incoming file %u: %s (%" G_GUINT64_FORMAT " bytes)\n",
+            (unsigned)entries[i].file_id, entries[i].name,
+            entries[i].file_size);
+
+  if (ft_send_spec == NULL || *ft_send_spec == '\0' || s->sent_back) return;
+  s->sent_back = TRUE;
+
+  DFileSendItem item = {NULL, NULL, 0};
+  if (g_str_has_prefix(ft_send_spec, "gen:")) {
+    /* gen:<seed>:<size> — deterministic self-checking test file. */
+    gchar **parts = g_strsplit(ft_send_spec, ":", 3);
+    gboolean ok = parts[1] != NULL && parts[2] != NULL && parts[1][0] &&
+                  parts[2][0];
+    guint64 seed = ok ? g_ascii_strtoull(parts[1], NULL, 10) : 0;
+    guint64 size = ok ? g_ascii_strtoull(parts[2], NULL, 10) : 0;
+    gchar *dir = g_build_filename(g_get_tmp_dir(), "hwphonelink-ft-send",
+                                  NULL);
+    if (ok && g_mkdir_with_parents(dir, 0755) >= 0 &&
+        ft_testfile_generate(dir, seed, size, &item.path, &item.name)) {
+      g_print("FT: generating send file %s (%" G_GUINT64_FORMAT
+              " bytes, seed %" G_GUINT64_FORMAT ")\n",
+              item.name, size, seed);
+    } else {
+      ok = FALSE;
+    }
+    g_free(dir);
+    g_strfreev(parts);
+    if (!ok) {
+      g_print("FT: failed to generate send file (spec %s)\n", ft_send_spec);
+      s->sent_back = FALSE;
+      return;
+    }
+  } else {
+    item.path = g_strdup(ft_send_spec);
+    item.name = g_strdup(g_path_get_basename(ft_send_spec));
+  }
+
+  GError *err = NULL;
+  if (!dfile_conn_send_files(dc, &item, 1, &err)) {
+    g_print("FT: start reverse send failed: %s\n", err ? err->message : "?");
+    g_clear_error(&err);
+    s->sent_back = FALSE;
+  }
+  g_free(item.path);
+  g_free(item.name);
+}
+
+static void on_ft_result(DFileConn *dc, gboolean is_sender, gboolean ok,
+                         const gchar *msg, gpointer user_data) {
+  (void)dc;
+  (void)user_data;
+  g_print("FT: %s transfer %s: %s\n", is_sender ? "send" : "recv",
+          ok ? "OK" : "FAILED", msg);
+}
+
+static void on_ft_closed(DFileConn *dc, gpointer user_data) {
+  g_print("FT: DFile session closed\n");
+  g_free(user_data);
+  /* Drop the session's external ref; the engine's internal ref keeps the
+   * structure alive until its thread exits. */
+  dfile_conn_unref(dc);
+}
+
+static gboolean on_ft_connection(GSocketService *service,
+                                 GSocketConnection *conn,
+                                 gpointer source_object) {
+  (void)service;
+  (void)source_object;
+
+  gchar *ip = NULL;
+  GError *aerr = NULL;
+  GSocketAddress *raddr = g_socket_connection_get_remote_address(conn, &aerr);
+  if (raddr && G_IS_INET_SOCKET_ADDRESS(raddr)) {
+    GInetAddress *ia = g_inet_socket_address_get_address(
+        G_INET_SOCKET_ADDRESS(raddr));
+    if (ia) ip = g_inet_address_to_string(ia);
+    g_object_unref(raddr);
+  } else if (raddr) {
+    g_object_unref(raddr);
+  }
+  g_clear_error(&aerr);
+  g_print("FT: DFile session from %s\n", ip ? ip : "?");
+
+  DFileConn *dc = dfile_conn_new_server(conn);
+  if (dc == NULL) {
+    g_print("FT: engine start failed\n");
+    g_object_unref(conn);
+    g_free(ip);
+    return TRUE;
+  }
+  FtSession *s = g_new0(FtSession, 1);
+  dfile_conn_set_recv_dir(dc, ft_dir);
+  dfile_conn_set_callbacks(dc, on_ft_negotiated, on_ft_file_list,
+                           on_ft_result, on_ft_closed, s);
+  g_free(ip);
+  return TRUE;
+}
+
 static SoftbusDevice* build_local_device(const gchar *device_id) {
   SoftbusDevice *dev = softbus_device_new();
   dev->device_id = g_strdup(device_id);
@@ -208,6 +338,7 @@ int main(int argc, char *argv[]) {
   gboolean use_p2p_fallback = FALSE;
   gboolean use_infra = FALSE;
   gchar *device_id = NULL;
+  gint ft_port_opt = 54322;
 
   GOptionEntry entries[] = {
     {"phy", 'p', 0, G_OPTION_ARG_STRING, &phy_name, "Physical interface name (e.g., phy0)", "PHY"},
@@ -216,6 +347,9 @@ int main(int argc, char *argv[]) {
     {"infra", 'n', 0, G_OPTION_ARG_NONE, &use_infra, "Use Infrastructure mode (LAN/Wi-Fi/Ethernet) instead of SoftAP", NULL},
     {"device-id", 0, 0, G_OPTION_ARG_STRING, &device_id, "Local device id for dsoftbus auth (default: hwphonelink-pc-001)", "ID"},
     {"psk", 0, 0, G_OPTION_ARG_STRING, &psk, "Pre-provisioned PSK for auth (default: $HWPONELINK_PSK or built-in test PSK)", "SECRET"},
+    {"ft-port", 0, 0, G_OPTION_ARG_INT, &ft_port_opt, "DFile (file transfer) TCP port, 0 disables the listener (default 54322)", "PORT"},
+    {"ft-dir", 0, 0, G_OPTION_ARG_STRING, &ft_dir, "Directory for received files (default: ./ft-received)", "DIR"},
+    {"ft-send", 0, 0, G_OPTION_ARG_STRING, &ft_send_spec, "Auto-send after receiving: PATH, or gen:<seed>:<size> for a deterministic test file (default: off)", "SPEC"},
     {NULL}
   };
 
@@ -235,6 +369,11 @@ int main(int argc, char *argv[]) {
       g_print("No PSK given — using built-in test PSK (replay stand only)\n");
     }
   }
+  if (ft_port_opt < 0) {
+    g_printerr("--ft-port must be >= 0\n");
+    return 1;
+  }
+  ft_port = (guint)ft_port_opt;
   if (device_id == NULL) {
     device_id = g_strdup("hwphonelink-pc-001");
   }
@@ -292,7 +431,41 @@ int main(int argc, char *argv[]) {
   g_print("AP Interface: %s\n", hw_phone_link_transport_get_ap_interface(transport));
   g_print("AP IP: %s\n", hw_phone_link_transport_get_ap_ip(transport));
   g_print("Channel: %u\n", hw_phone_link_transport_get_ap_channel(transport));
-  g_print("Local device: %s\n", softbus_device_to_string(local_device));
+  gchar *dstr = softbus_device_to_string(local_device);
+  g_print("Local device: %s\n", dstr);
+  g_free(dstr);
+
+  // DFile (file transfer) listener
+  if (ft_port > 0) {
+    if (ft_dir == NULL) ft_dir = g_strdup("ft-received");
+    if (g_mkdir_with_parents(ft_dir, 0755) < 0) {
+      g_printerr("Cannot create receive dir %s: %s\n", ft_dir,
+                 g_strerror(errno));
+      return 1;
+    }
+    ft_service = g_socket_service_new();
+    GError *lerr = NULL;
+    if (!g_socket_listener_add_inet_port(G_SOCKET_LISTENER(ft_service),
+                                         (guint16)ft_port, NULL, &lerr)) {
+      g_printerr("FT: cannot listen on port %u: %s\n", ft_port,
+                 lerr->message);
+      g_clear_error(&lerr);
+      g_object_unref(ft_service);
+      ft_service = NULL;
+    } else {
+      g_signal_connect(ft_service, "incoming",
+                       G_CALLBACK(on_ft_connection), NULL);
+      g_socket_service_start(ft_service);
+      if (!g_socket_service_is_active(ft_service)) {
+        g_printerr("FT: cannot listen on port %u\n", ft_port);
+        g_object_unref(ft_service);
+        ft_service = NULL;
+      } else {
+        g_print("FT: DFile listener on port %u (recv dir: %s%s)\n", ft_port,
+                ft_dir, ft_send_spec ? " (auto-send after receive)" : "");
+      }
+    }
+  }
 
   // Run main loop
   main_loop = g_main_loop_new(NULL, FALSE);
@@ -300,12 +473,19 @@ int main(int argc, char *argv[]) {
 
   // Cleanup
   g_print("Stopping transport...\n");
+  if (ft_service) {
+    g_socket_service_stop(ft_service);
+    g_object_unref(ft_service);
+    ft_service = NULL;
+  }
   hw_phone_link_transport_stop(transport, NULL);
   g_object_unref(transport);
   g_main_loop_unref(main_loop);
   softbus_device_unref(local_device);
   g_free(psk);
   g_free(device_id);
+  g_free(ft_dir);
+  g_free(ft_send_spec);
 
   g_print("Daemon stopped\n");
   return 0;

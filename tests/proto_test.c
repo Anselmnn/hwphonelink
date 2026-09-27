@@ -9,6 +9,8 @@
  *   - Auth FSM (full PSK exchange in-process, wrong-PSK rejection,
  *     retry budget exhaustion)
  *   - Session layer (frame pump over a real socketpair)
+ *   - DFile frame codec (RE'd wire format: setting, file header,
+ *     id-list, data, ACK V1/V2 count-encoding, RST) + ft test-file helper
  *
  * No network required; runs in CI.
  */
@@ -24,6 +26,8 @@
 #include "proto/softbus_crypto.h"
 #include "proto/softbus_auth.h"
 #include "proto/softbus_session.h"
+#include "proto/dfile_frame.h"
+#include "proto/ft_testfile.h"
 
 static int failures = 0;
 
@@ -507,6 +511,420 @@ static void test_session_socketpair(void) {
   g_object_unref(sock_b);
 }
 
+/* ============================ DFile codec ============================ */
+
+static void put16_test(guint8 *p, guint16 v) {
+  p[0] = (guint8)(v >> 8);
+  p[1] = (guint8)(v & 0xff);
+}
+
+static void put32_test(guint8 *p, guint32 v) {
+  p[0] = (guint8)(v >> 24);
+  p[1] = (guint8)((v >> 16) & 0xff);
+  p[2] = (guint8)((v >> 8) & 0xff);
+  p[3] = (guint8)(v & 0xff);
+}
+
+static void test_dfile_header_unpack(void) {
+  g_print("dfile header unpack\n");
+  guint8 buf[8] = {0};
+  put16_test(buf + 4, 7);
+  put16_test(buf + 6, 100);
+  DFileFrameHeader h;
+  CHECK(dfile_frame_header_unpack(buf, 8, &h) == 0);
+  CHECK(h.type == 0 && h.flag == 0 && h.session_id == 0);
+  CHECK(h.trans_id == 7 && h.length == 100);
+  /* fewer than 8 bytes -> -1 */
+  CHECK(dfile_frame_header_unpack(buf, 5, &h) == -1);
+  /* zero payload -> -2 */
+  buf[6] = 0;
+  buf[7] = 0;
+  CHECK(dfile_frame_header_unpack(buf, 8, &h) == -2);
+  /* length above the main-loop sanity cap -> -2 */
+  put16_test(buf + 6, DFILE_FRAME_MAX_LEN + 1);
+  CHECK(dfile_frame_header_unpack(buf, 8, &h) == -2);
+}
+
+static void test_dfile_setting_roundtrip(void) {
+  g_print("dfile setting round-trip\n");
+  DFileSetting s;
+  memset(&s, 0, sizeof(s));
+  s.mtu = DFILE_DEFAULT_FRAME_SIZE;
+  s.conn_type = 1;
+  s.dfile_version = DFILE_VERSION;
+  s.capability = DFILE_CAPS_LINK_SEQUENCE;
+  g_strlcpy(s.product_version, "hwphonelink 0.1.0",
+            sizeof(s.product_version));
+  s.is_support_160m = 1;
+
+  guint8 frame[256];
+  gssize n = dfile_encode_setting(frame, sizeof(frame), &s);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + DFILE_SETTING_PAYLOAD_LEN));
+  CHECK(frame[0] == DFILE_FRAME_SETTING);
+  CHECK(frame[7] == DFILE_SETTING_PAYLOAD_LEN);
+  CHECK(frame[8] == 0x05 && frame[9] == 0xC0); /* mtu 1472 BE */
+
+  DFileSetting t;
+  memset(&t, 0, sizeof(t));
+  CHECK(dfile_decode_setting(frame, (gsize)n, &t));
+  CHECK(t.mtu == s.mtu && t.conn_type == s.conn_type);
+  CHECK(t.dfile_version == s.dfile_version);
+  CHECK(t.capability == s.capability && t.is_support_160m == 1);
+  CHECK(strcmp(t.product_version, "hwphonelink 0.1.0") == 0);
+  /* wrong frame type -> reject */
+  frame[0] = DFILE_FRAME_RST;
+  CHECK(!dfile_decode_setting(frame, (gsize)n, &t));
+}
+
+static void test_dfile_file_header_roundtrip(void) {
+  g_print("dfile file-header round-trip\n");
+  DFileHeaderEntry ents[3] = {
+      {1, 100, "a.txt"},
+      {2, 200, "b.txt"},
+      {3, 300, "c.txt"},
+  };
+  guint8 frame[DFILE_DEFAULT_FRAME_SIZE];
+  gsize written = 0;
+  gssize n = dfile_encode_file_header(frame, sizeof(frame), 4, 3, ents, 0, 3,
+                                      &written);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 2 + 3 * 17));
+  CHECK(written == 3);
+  /* raw layout: node @0, entry 0 @2 (fid, u64 size, nameLen, name) */
+  CHECK(frame[8 + 0] == 0 && frame[8 + 1] == 3);  /* node = 3 */
+  CHECK(frame[8 + 2] == 0 && frame[8 + 3] == 1);  /* fileId 1 */
+  CHECK(frame[8 + 12] == 0 && frame[8 + 13] == 5); /* nameLen 5 */
+  CHECK(memcmp(frame + 8 + 14, "a.txt", 5) == 0);
+
+  guint16 trans = 0, node = 0;
+  DFileHeaderEntry *dec = NULL;
+  gsize dn = 0;
+  CHECK(dfile_decode_file_header(frame, (gsize)n, &trans, &node, &dec, &dn));
+  CHECK(trans == 4 && node == 3 && dn == 3);
+  CHECK(dec[0].file_id == 1 && dec[0].file_size == 100);
+  CHECK(strcmp(dec[0].name, "a.txt") == 0);
+  CHECK(dec[1].file_id == 2 && dec[1].file_size == 200);
+  CHECK(strcmp(dec[1].name, "b.txt") == 0);
+  CHECK(dec[2].file_id == 3 && dec[2].file_size == 300);
+  CHECK(strcmp(dec[2].name, "c.txt") == 0);
+  dfile_header_entries_free(dec, dn);
+
+  /* size budget: a 44-byte frame fits node + 2 entries (8+2+17+17) */
+  written = 0;
+  n = dfile_encode_file_header(frame, 44, 4, 3, ents, 0, 3, &written);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 2 + 2 * 17));
+  CHECK(written == 2);
+  dec = NULL;
+  dn = 0;
+  CHECK(dfile_decode_file_header(frame, (gsize)n, &trans, &node, &dec, &dn));
+  CHECK(node == 3 && dn == 2);
+  dfile_header_entries_free(dec, dn);
+
+  /* bad: nameLen claims 3 bytes but only 1 is present */
+  guint8 bad[32];
+  memset(bad, 0, sizeof(bad));
+  bad[0] = DFILE_FRAME_FILE_HEADER;
+  put16_test(bad + 6, 15); /* 2 node + 2 fid + 8 size + 2 nameLen + 1 */
+  put16_test(bad + 8, 1);  /* node */
+  put16_test(bad + 10, 1); /* fileId */
+  put32_test(bad + 16, 1); /* size low word */
+  put16_test(bad + 20, 3); /* nameLen = 3 */
+  bad[22] = 'x';
+  dec = NULL;
+  dn = 0;
+  CHECK(!dfile_decode_file_header(bad, 23, &trans, &node, &dec, &dn));
+
+  /* bad: nameLen 0 */
+  put16_test(bad + 6, 14);
+  put16_test(bad + 20, 0);
+  CHECK(!dfile_decode_file_header(bad, 22, &trans, &node, &dec, &dn));
+}
+
+static void test_dfile_idlist_roundtrip(void) {
+  g_print("dfile id-list round-trip\n");
+  const guint16 ids[4] = {7, 8, 9, 10};
+  guint8 frame[64];
+  gssize n = dfile_encode_idlist(frame, sizeof(frame),
+                                 DFILE_FRAME_FILE_HEADER_CONFIRM, 0, 3, ids,
+                                 4);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 8));
+  CHECK(frame[0] == DFILE_FRAME_FILE_HEADER_CONFIRM);
+  CHECK(frame[5] == 3); /* transId low */
+  CHECK(frame[7] == 8); /* length = 2N */
+  CHECK(frame[8] == 0 && frame[9] == 7);
+  CHECK(frame[14] == 0 && frame[15] == 10);
+
+  guint16 trans = 0;
+  guint8 flag = 0;
+  guint16 *dec = NULL;
+  gsize dn = 0;
+  CHECK(dfile_decode_idlist(frame, (gsize)n, DFILE_FRAME_FILE_HEADER_CONFIRM,
+                            &trans, &flag, &dec, &dn));
+  CHECK(trans == 3 && flag == 0 && dn == 4);
+  CHECK(dec[0] == 7 && dec[1] == 8 && dec[2] == 9 && dec[3] == 10);
+  g_free(dec);
+  /* wrong expected type -> reject */
+  dec = NULL;
+  dn = 0;
+  CHECK(!dfile_decode_idlist(frame, (gsize)n, DFILE_FRAME_FILE_TRANSFER_REQ,
+                             &trans, &flag, &dec, &dn));
+}
+
+static void test_dfile_data_roundtrip(void) {
+  g_print("dfile data round-trip\n");
+  /* Max payload that fits in a DFILE_FRAME_MAX_SIZE frame:
+   * total = 8 (header) + 6 (fileId + seq) + payload. */
+  const gsize max_payload = DFILE_FRAME_MAX_SIZE - DFILE_FRAME_HEADER_LEN - 6;
+  guint8 *payload = g_malloc(max_payload);
+  for (gsize i = 0; i < max_payload; i++)
+    payload[i] = (guint8)(i * 31 + 7);
+
+  guint8 frame[DFILE_FRAME_MAX_SIZE];
+  gssize n = dfile_encode_data(frame, sizeof(frame), 2, 0, 1, 0, payload,
+                               max_payload);
+  CHECK(n == (gssize)DFILE_FRAME_MAX_SIZE);
+  CHECK(frame[0] == DFILE_FRAME_FILE_DATA);
+  CHECK(frame[1] == 0); /* START: no continue/end bits */
+
+  guint16 trans = 0, fid = 0;
+  guint8 flag = 0;
+  guint32 seq = 0;
+  const guint8 *pl = NULL;
+  gsize pln = 0;
+  CHECK(dfile_decode_data(frame, (gsize)n, &trans, &flag, &fid, &seq, &pl,
+                          &pln));
+  CHECK(trans == 2 && flag == 0 && fid == 1 && seq == 0);
+  CHECK(pln == max_payload && memcmp(pl, payload, pln) == 0);
+  CHECK(pl == frame + DFILE_FRAME_HEADER_LEN + 6);
+
+  /* one byte over the max payload -> reject */
+  n = dfile_encode_data(frame, sizeof(frame), 2, 0, 1, 0, payload,
+                        max_payload + 1);
+  CHECK(n == -1);
+
+  /* last partial block: CONTINUE|END */
+  guint8 tail[512];
+  memset(tail, 0x5A, sizeof(tail));
+  n = dfile_encode_data(frame, sizeof(frame), 2,
+                        DFILE_FLAG_DATA_CONTINUE | DFILE_FLAG_DATA_END, 1,
+                        712, tail, sizeof(tail));
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 6 + 512));
+  trans = 0;
+  flag = 0;
+  seq = 0;
+  CHECK(dfile_decode_data(frame, (gsize)n, &trans, &flag, &fid, &seq, &pl,
+                          &pln));
+  CHECK(flag == (DFILE_FLAG_DATA_CONTINUE | DFILE_FLAG_DATA_END));
+  CHECK(seq == 712 && pln == 512 && memcmp(pl, tail, 512) == 0);
+  g_free(payload);
+}
+
+static void test_dfile_ack_v1(void) {
+  g_print("dfile ack V1\n");
+  DFileAckEntry ents[3] = {
+      {1, 5, 0, 0},
+      {2, 0, 0, 0},
+      {3, 9, 0, 0},
+  };
+  guint8 frame[256];
+  gssize n = dfile_encode_ack(frame, sizeof(frame), FALSE, 4, 0, ents, 3);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 6 + 37 * 3));
+  CHECK(frame[0] == DFILE_FRAME_FILE_DATA_ACK);
+  CHECK(frame[6] == 0 && frame[7] == (guint8)(6 + 37 * 3));
+  /* entries packed at payload 6*i (count-encoding is length-only) */
+  CHECK(frame[8 + 0] == 0 && frame[8 + 1] == 1);   /* e0 fid 1 */
+  CHECK(frame[8 + 5] == 5);                        /* e0 seq 5 */
+  CHECK(frame[8 + 6] == 0 && frame[8 + 7] == 2);   /* e1 fid 2 */
+  CHECK(frame[8 + 12] == 0 && frame[8 + 13] == 3); /* e2 fid 3 */
+  /* reserved tail (after last entry) stays zero */
+  CHECK(frame[8 + 18] == 0 && frame[8 + 6 + 37 * 3 - 1] == 0);
+
+  guint16 trans = 0;
+  guint8 flag = 0;
+  gboolean v2 = TRUE;
+  DFileAckEntry *dec = NULL;
+  gsize dn = 99;
+  CHECK(dfile_decode_ack(frame, (gsize)n, &trans, &flag, &v2, &dec, &dn));
+  CHECK(trans == 4 && flag == 0 && !v2 && dn == 3);
+  CHECK(dec[0].file_id == 1 && dec[0].last_seq == 5);
+  CHECK(dec[1].file_id == 2 && dec[1].last_seq == 0);
+  CHECK(dec[2].file_id == 3 && dec[2].last_seq == 9);
+  g_free(dec);
+
+  /* hand-built raw frame (RE layout): trans 7, flag ACK_RETRAN */
+  guint8 raw[8 + 6 + 37 * 3];
+  memset(raw, 0, sizeof(raw));
+  raw[0] = DFILE_FRAME_FILE_DATA_ACK;
+  raw[1] = DFILE_FLAG_ACK_RETRAN;
+  put16_test(raw + 4, 7);
+  put16_test(raw + 6, 6 + 37 * 3);
+  put16_test(raw + 8 + 0, 2);
+  put32_test(raw + 8 + 2, 3);
+  put16_test(raw + 8 + 6, 5);
+  put32_test(raw + 8 + 8, 255);
+  put16_test(raw + 8 + 12, 9);
+  put32_test(raw + 8 + 14, 256);
+  trans = 0;
+  flag = 0;
+  v2 = TRUE;
+  dec = NULL;
+  dn = 99;
+  CHECK(dfile_decode_ack(raw, sizeof(raw), &trans, &flag, &v2, &dec, &dn));
+  CHECK(trans == 7 && flag == DFILE_FLAG_ACK_RETRAN && !v2 && dn == 3);
+  CHECK(dec[0].file_id == 2 && dec[0].last_seq == 3);
+  CHECK(dec[1].file_id == 5 && dec[1].last_seq == 255);
+  CHECK(dec[2].file_id == 9 && dec[2].last_seq == 256);
+  g_free(dec);
+
+  /* N = 0: V1 length field 6 */
+  n = dfile_encode_ack(frame, sizeof(frame), FALSE, 4, 0, NULL, 0);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 6));
+  dec = NULL;
+  dn = 0;
+  CHECK(dfile_decode_ack(frame, (gsize)n, &trans, &flag, &v2, &dec, &dn));
+  CHECK(!v2 && dn == 0 && dec == NULL);
+}
+
+static void test_dfile_ack_v2(void) {
+  g_print("dfile ack V2\n");
+  DFileAckEntry ents[3] = {
+      {1, 4, 0x1234, 0x5678},
+      {2, 0, 0, 0},
+      {3, 9, 0, 0},
+  };
+  guint8 frame[256];
+  gssize n = dfile_encode_ack(frame, sizeof(frame), TRUE, 4, 0, ents, 3);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 12 + 37 * 3));
+  CHECK(frame[6] == 0 && frame[7] == (guint8)(12 + 37 * 3));
+  /* entry 0: fid @0, seq @2, c @6, d @8 */
+  CHECK(frame[8 + 1] == 1);
+  CHECK(frame[8 + 5] == 4); /* seq low byte */
+  CHECK(frame[8 + 6] == 0x12 && frame[8 + 7] == 0x34);
+  CHECK(frame[8 + 8] == 0x56 && frame[8 + 9] == 0x78);
+  /* 2-byte gap @10-11, entries 1..N-1 packed at 12 + 6(i-1) */
+  CHECK(frame[8 + 10] == 0 && frame[8 + 11] == 0);
+  CHECK(frame[8 + 12] == 0 && frame[8 + 13] == 2);
+  CHECK(frame[8 + 18] == 0 && frame[8 + 19] == 3);
+  /* reserved tail stays zero */
+  CHECK(frame[8 + 24] == 0 && frame[8 + 12 + 37 * 3 - 1] == 0);
+
+  guint16 trans = 0;
+  guint8 flag = 0;
+  gboolean v2 = FALSE;
+  DFileAckEntry *dec = NULL;
+  gsize dn = 0;
+  CHECK(dfile_decode_ack(frame, (gsize)n, &trans, &flag, &v2, &dec, &dn));
+  CHECK(v2 && dn == 3);
+  CHECK(dec[0].file_id == 1 && dec[0].last_seq == 4);
+  CHECK(dec[0].c == 0x1234 && dec[0].d == 0x5678);
+  CHECK(dec[1].file_id == 2 && dec[1].last_seq == 0);
+  CHECK(dec[2].file_id == 3 && dec[2].last_seq == 9);
+  g_free(dec);
+
+  /* N = 0 V2: length field 12 is valid (12 % 37 == 12) */
+  n = dfile_encode_ack(frame, sizeof(frame), TRUE, 4, 0, NULL, 0);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 12));
+  dec = NULL;
+  dn = 0;
+  CHECK(dfile_decode_ack(frame, (gsize)n, &trans, &flag, &v2, &dec, &dn));
+  CHECK(v2 && dn == 0 && dec == NULL);
+}
+
+static void test_dfile_ack_bad(void) {
+  g_print("dfile ack invalid count encoding\n");
+  guint8 raw[8 + 0x5c1];
+  const guint16 bad_lengths[] = {7, 42, 0x5c1};
+  for (gsize i = 0; i < G_N_ELEMENTS(bad_lengths); i++) {
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DFILE_FRAME_FILE_DATA_ACK;
+    put16_test(raw + 6, bad_lengths[i]);
+    guint16 trans = 0;
+    guint8 flag = 0;
+    gboolean v2 = FALSE;
+    DFileAckEntry *dec = NULL;
+    gsize dn = 0;
+    CHECK(!dfile_decode_ack(raw, (gsize)(8 + bad_lengths[i]), &trans, &flag,
+                            &v2, &dec, &dn));
+  }
+}
+
+static void test_dfile_rst_roundtrip(void) {
+  g_print("dfile rst round-trip\n");
+  guint8 frame[64];
+  const guint16 ids[2] = {3, 7};
+  gssize n = dfile_encode_rst(frame, sizeof(frame), 2,
+                              DFILE_RST_INTERNAL_ERROR, ids, 2);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 2 + 4));
+  CHECK(frame[0] == DFILE_FRAME_RST);
+  CHECK(frame[8] == 0 && frame[9] == 209);
+  CHECK(frame[10] == 0 && frame[11] == 3);
+
+  guint16 trans = 0, code = 0;
+  guint16 *dec = NULL;
+  gsize dn = 0;
+  CHECK(dfile_decode_rst(frame, (gsize)n, &trans, &code, &dec, &dn));
+  CHECK(trans == 2 && code == DFILE_RST_INTERNAL_ERROR && dn == 2);
+  CHECK(dec[0] == 3 && dec[1] == 7);
+  g_free(dec);
+
+  /* no ids: payload is the code only */
+  n = dfile_encode_rst(frame, sizeof(frame), 1, DFILE_RST_CANCEL, NULL, 0);
+  CHECK(n == (gssize)(DFILE_FRAME_HEADER_LEN + 2));
+  trans = 0;
+  code = 0;
+  dec = NULL;
+  dn = 0;
+  CHECK(dfile_decode_rst(frame, (gsize)n, &trans, &code, &dec, &dn));
+  CHECK(code == DFILE_RST_CANCEL && dn == 0 && dec == NULL);
+}
+
+static void test_ft_testfile(void) {
+  g_print("ft testfile helper\n");
+  const gchar *sha64 =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  gchar *good = g_strdup_printf("ft-%s.bin", sha64);
+  gchar *sha = ft_testfile_name_sha(good);
+  CHECK(sha != NULL && strcmp(sha, sha64) == 0);
+  g_free(sha);
+  g_free(good);
+  CHECK(ft_testfile_name_sha("ft-xyz.bin") == NULL);
+  CHECK(ft_testfile_name_sha("x" "ft-0123456789abcdef0123456789abcdef"
+                              "0123456789abcdef0123456789abcdef.bin") == NULL);
+  CHECK(ft_testfile_name_sha(NULL) == NULL);
+
+  /* generator: name carries the sha256 of the content; deterministic */
+  gchar *dir = g_build_filename(g_get_tmp_dir(), "hwphonelink-ft-test", NULL);
+  g_mkdir_with_parents(dir, 0755);
+  gchar *path = NULL;
+  gchar *wire = NULL;
+  CHECK(ft_testfile_generate(dir, 42, 7000, &path, &wire));
+  CHECK(path != NULL && wire != NULL);
+  if (path != NULL && wire != NULL) {
+    gchar *data = NULL;
+    gsize len = 0;
+    gboolean ok = g_file_get_contents(path, &data, &len, NULL) && len == 7000;
+    CHECK(ok);
+    if (ok) {
+      GChecksum *c = g_checksum_new(G_CHECKSUM_SHA256);
+      g_checksum_update(c, (const guchar *)data, (gssize)len);
+      gchar *expected = g_strdup_printf("ft-%s.bin",
+                                        g_checksum_get_string(c));
+      CHECK(strcmp(wire, expected) == 0);
+      g_free(expected);
+      g_checksum_free(c);
+    }
+    g_free(data);
+    gchar *path2 = NULL;
+    gchar *wire2 = NULL;
+    CHECK(ft_testfile_generate(dir, 42, 7000, &path2, &wire2));
+    CHECK(wire2 != NULL && strcmp(wire2, wire) == 0);
+    g_free(path2);
+    g_free(wire2);
+  }
+  g_free(path);
+  g_free(wire);
+  g_free(dir);
+}
+
 /* ============================ Main ============================ */
 
 int main(void) {
@@ -526,6 +944,16 @@ int main(void) {
   test_auth_wrong_psk();
   test_auth_retry_exhaustion();
   test_session_socketpair();
+  test_dfile_header_unpack();
+  test_dfile_setting_roundtrip();
+  test_dfile_file_header_roundtrip();
+  test_dfile_idlist_roundtrip();
+  test_dfile_data_roundtrip();
+  test_dfile_ack_v1();
+  test_dfile_ack_v2();
+  test_dfile_ack_bad();
+  test_dfile_rst_roundtrip();
+  test_ft_testfile();
 
   g_mutex_clear(&test_lock);
   g_cond_clear(&test_cond);

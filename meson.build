@@ -46,6 +46,9 @@ headers = [
   'src/proto/softbus_crypto.h',
   'src/proto/softbus_auth.h',
   'src/proto/softbus_session.h',
+  'src/proto/dfile_frame.h',
+  'src/proto/dfile_conn.h',
+  'src/proto/ft_testfile.h',
 ]
 
 inc = include_directories('src')
@@ -58,6 +61,9 @@ proto_sources = [
   'src/proto/softbus_crypto.c',
   'src/proto/softbus_auth.c',
   'src/proto/softbus_session.c',
+  'src/proto/dfile_frame.c',
+  'src/proto/dfile_conn.c',
+  'src/proto/ft_testfile.c',
 ]
 
 proto_lib = library(
