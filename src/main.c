@@ -38,6 +38,49 @@ static gchar *psk = NULL;
 /* DFile (file transfer) listener: raw TCP, separate from the dsoftbus
  * session connection. One DFileConn engine per accepted connection. */
 static GSocketService *ft_service = NULL;
+
+/*
+ * GSocketService lifetime API differs between this system's GLib build
+ * (g_socket_service_start/stop/is_active, g_socket_service_new() with no
+ * argument) and upstream GLib (no such functions; g_socket_service_new()
+ * takes a worker count and start/stop live on GSocketListener).  Meson
+ * probes the API surface and defines HAS_GLIB_SVC_LIFETIME when the
+ * g_socket_service_* variants exist.  Everything else used here
+ * (add_inet_port, the "incoming" signal with the
+ * gboolean (GSocketService*, GSocketConnection*, GObject*) vfunc) is
+ * identical in both.
+ */
+static GSocketService *ft_service_create(void) {
+#if defined(HAS_GLIB_SVC_LIFETIME)
+  return g_socket_service_new();
+#else
+  return g_socket_service_new(0);
+#endif
+}
+
+static gboolean ft_service_start_listen(GSocketService *svc, guint16 port,
+                                        GError **error) {
+#if defined(HAS_GLIB_SVC_LIFETIME)
+  g_socket_service_start(svc);
+  if (!g_socket_service_is_active(svc)) {
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                "FT listener failed to start on port %u", port);
+    return FALSE;
+  }
+  return TRUE;
+#else
+  return g_socket_listener_start(G_SOCKET_LISTENER(svc), error);
+#endif
+}
+
+static void ft_service_teardown(GSocketService *svc) {
+#if defined(HAS_GLIB_SVC_LIFETIME)
+  g_socket_service_stop(svc);
+#else
+  g_socket_listener_stop(G_SOCKET_LISTENER(svc));
+#endif
+  g_object_unref(svc);
+}
 static gchar *ft_dir = NULL;
 static gchar *ft_send_spec = NULL;
 static guint ft_port = 0;
@@ -443,7 +486,7 @@ int main(int argc, char *argv[]) {
                  g_strerror(errno));
       return 1;
     }
-    ft_service = g_socket_service_new();
+    ft_service = ft_service_create();
     GError *lerr = NULL;
     if (!g_socket_listener_add_inet_port(G_SOCKET_LISTENER(ft_service),
                                          (guint16)ft_port, NULL, &lerr)) {
@@ -455,9 +498,10 @@ int main(int argc, char *argv[]) {
     } else {
       g_signal_connect(ft_service, "incoming",
                        G_CALLBACK(on_ft_connection), NULL);
-      g_socket_service_start(ft_service);
-      if (!g_socket_service_is_active(ft_service)) {
-        g_printerr("FT: cannot listen on port %u\n", ft_port);
+      if (!ft_service_start_listen(ft_service, (guint16)ft_port, &lerr)) {
+        g_printerr("FT: cannot listen on port %u: %s\n", ft_port,
+                   lerr->message);
+        g_clear_error(&lerr);
         g_object_unref(ft_service);
         ft_service = NULL;
       } else {
@@ -474,8 +518,7 @@ int main(int argc, char *argv[]) {
   // Cleanup
   g_print("Stopping transport...\n");
   if (ft_service) {
-    g_socket_service_stop(ft_service);
-    g_object_unref(ft_service);
+    ft_service_teardown(ft_service);
     ft_service = NULL;
   }
   hw_phone_link_transport_stop(transport, NULL);

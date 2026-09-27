@@ -31,7 +31,7 @@ jobs:
             meson ninja-build gcc pkg-config \
             libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
             libjson-glib-dev libssl-dev \
-            libglib2.0-dev libgio2.0-dev \
+            libglib2.0-dev \
             hostapd dnsmasq iptables iproute2 \
             wireless-tools iw \
             systemd libsystemd-dev \
@@ -82,7 +82,7 @@ jobs:
             meson ninja-build gcc pkg-config \
             libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
             libjson-glib-dev libssl-dev \
-            libglib2.0-dev libgio2.0-dev \
+            libglib2.0-dev \
             hostapd dnsmasq iptables iproute2 \
             wireless-tools iw \
             systemd libsystemd-dev \
@@ -145,7 +145,7 @@ jobs:
             meson ninja-build gcc pkg-config \
             libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
             libjson-glib-dev libssl-dev \
-            libglib2.0-dev libgio2.0-dev \
+            libglib2.0-dev \
             cppcheck clang-tidy
 
       - name: Run cppcheck

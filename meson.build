@@ -27,6 +27,28 @@ add_project_arguments([
   '-Wno-unused-parameter',
 ], language: 'c')
 
+# GSocketService lifetime API probe: some GLib builds expose
+# g_socket_service_start/stop/is_active (void-returning, and
+# g_socket_service_new() with no argument); upstream GLib has no such
+# functions and uses g_socket_listener_start/stop instead.  Compile-only
+# check: taking the function address is enough to test the declarations.
+cc = meson.get_compiler('c')
+glib_has_svc_lifetime = cc.compiles(
+  '''
+  #include <gio/gio.h>
+  int main (void) {
+    (void) g_socket_service_start;
+    (void) g_socket_service_stop;
+    (void) g_socket_service_is_active;
+    return 0;
+  }
+  ''',
+  name: 'g_socket_service_start/stop/is_active',
+  dependencies: [dep_glib, dep_gio])
+if glib_has_svc_lifetime
+  add_project_arguments('-DHAS_GLIB_SVC_LIFETIME', language: 'c')
+endif
+
 # Installation paths
 prefix = get_option('prefix')
 bindir = join_paths(prefix, 'bin')
