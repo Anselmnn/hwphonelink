@@ -57,13 +57,15 @@ jobs:
       - name: Create package
         run: |
           DESTDIR=/tmp/install ninja -C builddir install
-          cd /tmp/install && tar -czf "${{ github.workspace }}/hwphonelink-${{ github.ref_name }}-linux-x86_64.tar.gz" .
+          # Artifacts go to /tmp: in container jobs the workspace is mounted
+          # at /__w/... while ${{ github.workspace }} is the host path.
+          cd /tmp/install && tar -czf /tmp/hwphonelink-${{ github.ref_name }}-linux-x86_64.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: hwphonelink-${{ github.ref_name }}-linux-x86_64
-          path: ${{ github.workspace }}/hwphonelink-*-linux-x86_64.tar.gz
+          path: /tmp/hwphonelink-*-linux-x86_64.tar.gz
 
   build-debian:
     name: Build on Debian
@@ -121,13 +123,13 @@ jobs:
            (wpa_supplicant) with concurrent STA+AP support. Validated on
            RTL8822CE/rtw88.
           EOF
-          dpkg-deb --build /tmp/install "${{ github.workspace }}/hwphonelink_${{ github.ref_name }}_amd64.deb"
+          dpkg-deb --build /tmp/install /tmp/hwphonelink_${{ github.ref_name }}_amd64.deb
 
       - name: Upload deb package
         uses: actions/upload-artifact@v4
         with:
           name: hwphonelink_${{ github.ref_name }}_amd64.deb
-          path: ${{ github.workspace }}/hwphonelink_${{ github.ref_name }}_amd64.deb
+          path: /tmp/hwphonelink_${{ github.ref_name }}_amd64.deb
 
   static-analysis:
     name: Static Analysis
