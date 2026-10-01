@@ -71,6 +71,11 @@ headers = [
   'src/proto/dfile_frame.h',
   'src/proto/dfile_conn.h',
   'src/proto/ft_testfile.h',
+  'src/proto/fillp_frame.h',
+  'src/proto/fillp_conn.h',
+  'src/proto/vtp_frame.h',
+  'src/proto/h264_testfile.h',
+  'src/proto/stream_file.h',
 ]
 
 inc = include_directories('src')
@@ -86,6 +91,11 @@ proto_sources = [
   'src/proto/dfile_frame.c',
   'src/proto/dfile_conn.c',
   'src/proto/ft_testfile.c',
+  'src/proto/fillp_frame.c',
+  'src/proto/fillp_conn.c',
+  'src/proto/vtp_frame.c',
+  'src/proto/h264_testfile.c',
+  'src/proto/stream_file.c',
 ]
 
 proto_lib = library(

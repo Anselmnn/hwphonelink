@@ -11,6 +11,13 @@
  *   - Session layer (frame pump over a real socketpair)
  *   - DFile frame codec (RE'd wire format: setting, file header,
  *     id-list, data, ACK V1/V2 count-encoding, RST) + ft test-file helper
+ *   - fillp (Dstream) codec: 12B head + 8 management payloads, cookie
+ *     HMAC make/verify (incl. tamper + wrong-address rejection), 28-byte
+ *     compat address layout, wraparound-safe counter comparison
+ *   - VTP frame layer: AES-256-GCM COMMON framing round-trip, key
+ *     derivation, wrong-key / tamper / truncation / ext-bit rejection
+ *   - H.264 replay test-file generator: Annex-B invariants, sha-in-name,
+ *     determinism, corruption detection
  *
  * No network required; runs in CI.
  */
@@ -28,6 +35,9 @@
 #include "proto/softbus_session.h"
 #include "proto/dfile_frame.h"
 #include "proto/ft_testfile.h"
+#include "proto/fillp_frame.h"
+#include "proto/vtp_frame.h"
+#include "proto/h264_testfile.h"
 
 static int failures = 0;
 
@@ -925,6 +935,380 @@ static void test_ft_testfile(void) {
   g_free(dir);
 }
 
+/* ============================ fillp codec ============================ */
+
+static void test_fillp_head(void) {
+  guint8 buf[FILLP_HLEN];
+  gsize n = fillp_encode_head(buf, FP_PKT_DATA,
+                              FILLP_FLAG_DATA_FIRST | FILLP_FLAG_DATA_LAST,
+                              1400, 42, 10000);
+  CHECK(n == FILLP_HLEN);
+  /* raw BE layout: u16 flag, u16 len, u32 pkt, u32 seq */
+  CHECK(buf[0] == (guint8)FP_PKT_DATA); /* version nibble 0, type nibble */
+  CHECK(buf[1] == (guint8)(FILLP_FLAG_DATA_FIRST | FILLP_FLAG_DATA_LAST));
+  CHECK(buf[2] == 0x05 && buf[3] == 0x78); /* 1400 */
+  CHECK(buf[4] == 0 && buf[5] == 0 && buf[6] == 0 && buf[7] == 42); /* pktNum */
+  CHECK(buf[8] == 0 && buf[9] == 0 && buf[10] == 0x27 && buf[11] == 0x10); /* seqNum 10000 */
+
+  FpPktType type;
+  guint16 flags, dlen;
+  guint32 pkt, seq;
+  CHECK(fillp_decode_head(buf, n, &type, &flags, &dlen, &pkt, &seq));
+  CHECK(type == FP_PKT_DATA);
+  CHECK(flags == (guint16)(FILLP_FLAG_DATA_FIRST | FILLP_FLAG_DATA_LAST));
+  CHECK(dlen == 1400 && pkt == 42 && seq == 10000);
+
+  /* version nibble must be 0 */
+  buf[0] = (guint8)((1 << 4) | FP_PKT_DATA);
+  CHECK(!fillp_decode_head(buf, n, &type, &flags, &dlen, &pkt, &seq));
+  buf[0] = (guint8)FP_PKT_DATA;
+  /* short buffer */
+  CHECK(!fillp_decode_head(buf, FILLP_HLEN - 1, &type, &flags, &dlen, &pkt,
+                           &seq));
+  /* all-NULL out params are fine */
+  CHECK(fillp_decode_head(buf, n, NULL, NULL, NULL, NULL, NULL));
+
+  /* wraparound-safe "ahead of" comparison */
+  CHECK(fp_num_isbigger(1, 0xFFFFFFFF));
+  CHECK(fp_num_isbigger(0, 0xFFFFFFFF));
+  CHECK(!fp_num_isbigger(0xFFFFFFFF, 0));
+  CHECK(!fp_num_isbigger(5, 5));
+  CHECK(fp_num_isbigger(7, 5));
+  CHECK(!fp_num_isbigger(5, 7));
+}
+
+static void test_fillp_mgmt_roundtrip(void) {
+  guint8 buf[256];
+  gsize n;
+
+  /* CONN_REQ */
+  n = fillp_encode_conn_req(buf, sizeof(buf), 5000000, 819200, 819200,
+                            123456789ULL);
+  CHECK(n == FILLP_HLEN + FILLP_CONN_REQ_LEN);
+  FpPktType type;
+  CHECK(fillp_decode_head(buf, n, &type, NULL, NULL, NULL, NULL) &&
+        type == FP_PKT_CONN_REQ);
+  guint32 pres = 0, sc = 0, rc = 0;
+  guint64 ts = 0;
+  CHECK(fillp_decode_conn_req(buf, n, &pres, &sc, &rc, &ts));
+  CHECK(pres == 5000000 && sc == 819200 && rc == 819200 &&
+        ts == 123456789ULL);
+  CHECK(!fillp_decode_conn_req(buf, n + 1, &pres, &sc, &rc, &ts));
+
+  /* CONN_REQ_ACK / CONN_CONFIRM / CONN_CONFIRM_ACK */
+  guint8 mac_key[32];
+  memset(mac_key, 0x5a, sizeof(mac_key));
+  guint8 cookie[FILLP_COOKIE_LEN];
+  guint8 laddr[FILLP_ADDR_LEN], raddr[FILLP_ADDR_LEN];
+  fillp_addr_fill_ipv4(raddr, 40000, (const guint8[]){172, 50, 20, 54});
+  memset(laddr, 0, sizeof(laddr));
+  fillp_cookie_fill(cookie, mac_key, 999, 30000000, 111, 222, 333, 444,
+                    819200, 819200, 54323, 2, raddr, laddr);
+
+  n = fillp_encode_conn_req_ack(buf, sizeof(buf), 0x0102, cookie, 424242);
+  CHECK(n == FILLP_HLEN + FILLP_CONN_REQ_ACK_LEN);
+  guint16 tag = 0;
+  guint8 cookie2[FILLP_COOKIE_LEN];
+  CHECK(fillp_decode_conn_req_ack(buf, n, &tag, cookie2, &ts));
+  CHECK(tag == 0x0102 && ts == 424242);
+  CHECK(memcmp(cookie, cookie2, FILLP_COOKIE_LEN) == 0);
+
+  n = fillp_encode_conn_confirm(buf, sizeof(buf), 0x0102, cookie, raddr);
+  CHECK(n == FILLP_HLEN + FILLP_CONN_CONFIRM_LEN);
+  guint8 laddr2[FILLP_ADDR_LEN];
+  CHECK(fillp_decode_conn_confirm(buf, n, &tag, cookie2, laddr2));
+  CHECK(tag == 0x0102 && memcmp(cookie, cookie2, FILLP_COOKIE_LEN) == 0 &&
+        memcmp(raddr, laddr2, FILLP_ADDR_LEN) == 0);
+
+  n = fillp_encode_conn_confirm_ack(buf, sizeof(buf), 262144, 1048576, 1400,
+                                    laddr);
+  CHECK(n == FILLP_HLEN + FILLP_CONN_CONFIRM_ACK_LEN);
+  guint32 pkt_size = 0;
+  CHECK(fillp_decode_conn_confirm_ack(buf, n, &sc, &rc, &pkt_size, laddr2));
+  CHECK(sc == 262144 && rc == 1048576 && pkt_size == 1400 &&
+        memcmp(laddr, laddr2, FILLP_ADDR_LEN) == 0);
+
+  /* NACK: head.pktNum = begin, head.seqNum = recv offset,
+   * payload lastPktNum = end - 1 */
+  n = fillp_encode_nack(buf, sizeof(buf), FP_PKT_NACK, 100, 102, 5000,
+                        0xDEADBEEFCAFEBABEULL);
+  CHECK(n == FILLP_HLEN + FILLP_NACK_LEN);
+  guint32 begin = 0, end = 0, seqn = 0;
+  CHECK(fillp_decode_nack(buf, n, &begin, &end, &seqn));
+  CHECK(begin == 100 && end == 102 && seqn == 5000);
+  n = fillp_encode_nack(buf, sizeof(buf), FP_PKT_HISTORY_NACK, 7, 9, 100, 1);
+  CHECK(fillp_decode_nack(buf, n, &begin, &end, &seqn) && begin == 7 &&
+        end == 9 && seqn == 100);
+
+  /* PACK: cumulative ack in the head, lostSeq in the payload */
+  n = fillp_encode_pack(buf, sizeof(buf), 5000, 101, 5000, 1234);
+  CHECK(n == FILLP_HLEN + FILLP_PACK_LEN);
+  guint32 ack_seq = 0, ack_pkt = 0, lost = 0, rcv = 0;
+  CHECK(fillp_decode_pack(buf, n, &ack_seq, &ack_pkt, &lost, &rcv));
+  CHECK(ack_seq == 5000 && ack_pkt == 101 && lost == 5000 && rcv == 1234);
+
+  /* FIN */
+  n = fillp_encode_fin(buf, sizeof(buf), 0x0001);
+  CHECK(n == FILLP_HLEN + FILLP_FIN_LEN);
+  guint16 fflag = 0;
+  CHECK(fillp_decode_fin(buf, n, &fflag) && fflag == 1);
+  CHECK(fillp_decode_head(buf, n, &type, NULL, NULL, NULL, NULL) &&
+        type == FP_PKT_FIN);
+
+  /* undersized buffers are rejected */
+  CHECK(fillp_encode_conn_req(buf, FILLP_HLEN + FILLP_CONN_REQ_LEN - 1, 0, 0,
+                              0, 0) == (gssize)-1);
+  CHECK(fillp_encode_pack(buf, 10, 0, 0, 0, 0) == (gssize)-1);
+}
+
+static void test_fillp_cookie(void) {
+  guint8 mac_key[32], other_key[32];
+  memset(mac_key, 0x11, sizeof(mac_key));
+  memset(other_key, 0x22, sizeof(other_key));
+  guint8 laddr[FILLP_ADDR_LEN], laddr2[FILLP_ADDR_LEN], raddr[FILLP_ADDR_LEN];
+  fillp_addr_fill_ipv4(laddr, 54324, (const guint8[]){0, 0, 0, 0});
+  fillp_addr_fill_ipv4(laddr2, 54324, (const guint8[]){1, 2, 3, 4});
+  fillp_addr_fill_ipv4(raddr, 40000, (const guint8[]){172, 50, 20, 54});
+
+  guint8 cookie[FILLP_COOKIE_LEN];
+  fillp_cookie_fill(cookie, mac_key, 123456, 30000000, 1, 2, 3, 4, 819200,
+                    819200, 54323, 2, raddr, laddr);
+
+  CHECK(fillp_cookie_verify(cookie, mac_key, laddr));
+  CHECK(!fillp_cookie_verify(cookie, other_key, laddr)); /* wrong key */
+  CHECK(!fillp_cookie_verify(cookie, mac_key, laddr2));   /* wrong local addr */
+
+  /* every digested field is covered */
+  guint8 tampered[FILLP_COOKIE_LEN];
+  memcpy(tampered, cookie, sizeof(tampered));
+  tampered[36] ^= 0x01; /* genTime */
+  CHECK(!fillp_cookie_verify(tampered, mac_key, laddr));
+  memcpy(tampered, cookie, sizeof(tampered));
+  tampered[48] ^= 0x80; /* lifeTime */
+  CHECK(!fillp_cookie_verify(tampered, mac_key, laddr));
+  memcpy(tampered, cookie, sizeof(tampered));
+  tampered[70] ^= 0x01; /* remoteSock */
+  CHECK(!fillp_cookie_verify(tampered, mac_key, laddr));
+  memcpy(tampered, cookie, sizeof(tampered));
+  tampered[0] ^= 0xff; /* the digest itself */
+  CHECK(!fillp_cookie_verify(tampered, mac_key, laddr));
+
+  /* layout spot checks (all BE; computed, not hand-rolled hex) */
+  guint64 gen = 123456;
+  guint32 life = 30000000;
+  guint16 sport = 54323;
+  CHECK(cookie[32] == 0 && cookie[36] == 0 &&
+        cookie[37] == (guint8)(gen >> 16) && cookie[38] == (guint8)(gen >> 8) &&
+        cookie[39] == (guint8)gen);
+  CHECK(cookie[48] == (guint8)(life >> 24) &&
+        cookie[49] == (guint8)(life >> 16) &&
+        cookie[50] == (guint8)(life >> 8) && cookie[51] == (guint8)life);
+  CHECK(cookie[52] == 0 && cookie[55] == 1);  /* localPktSeq  @52 */
+  CHECK(cookie[56] == 0 && cookie[59] == 3);  /* remotePktSeq @56 */
+  CHECK(cookie[60] == 0 && cookie[63] == 2);  /* localMsgSeq  @60 */
+  CHECK(cookie[64] == 0 && cookie[67] == 4);  /* remoteMsgSeq @64 */
+  CHECK(cookie[68] == 0x00 && cookie[71] == 0x00); /* remoteSendCache 819200 @68 */
+  CHECK(cookie[72] == 0x00 && cookie[75] == 0x00); /* remoteRecvCache 819200 @72 */
+  CHECK(cookie[76] == (guint8)(sport >> 8) &&
+        cookie[77] == (guint8)sport && cookie[78] == 0 && cookie[79] == 2);
+  CHECK(memcmp(cookie + 80, raddr, FILLP_ADDR_LEN) == 0);
+
+  /* 28-byte compat address: sockaddr_in layout, zero-extended */
+  guint8 addr[FILLP_ADDR_LEN];
+  fillp_addr_fill_ipv4(addr, 0x1234, (const guint8[]){10, 20, 30, 40});
+  CHECK(addr[0] == 0 && addr[1] == 2);
+  CHECK(addr[2] == 0x12 && addr[3] == 0x34);
+  CHECK(addr[4] == 10 && addr[5] == 20 && addr[6] == 30 && addr[7] == 40);
+  gboolean zero = TRUE;
+  for (guint i = 8; i < FILLP_ADDR_LEN; i++)
+    zero = zero && addr[i] == 0;
+  CHECK(zero);
+}
+
+/* ============================ VTP frame ============================ */
+
+static void test_vtp_frame(void) {
+  const gchar *psk = "hwphonelink-test-psk";
+  guint8 key[VTP_KEY_LEN], key_b[VTP_KEY_LEN], key_c[VTP_KEY_LEN];
+  vtp_derive_key((const guint8 *)psk, strlen(psk), key);
+  vtp_derive_key((const guint8 *)psk, strlen(psk), key_b);
+  vtp_derive_key((const guint8 *)"different-psk", 13, key_c);
+  CHECK(memcmp(key, key_b, VTP_KEY_LEN) == 0);
+  CHECK(memcmp(key, key_c, VTP_KEY_LEN) != 0);
+
+  guint8 data[100];
+  for (guint i = 0; i < sizeof(data); i++) data[i] = (guint8)(i * 7 + 1);
+  guint8 frame[512];
+  gsize total = vtp_build_common_frame(frame, sizeof(frame), key,
+                                       VTP_MODE_COMMON, 0, 0, 123456789u,
+                                       data, sizeof(data));
+  CHECK(total == vtp_common_frame_size(100));
+  CHECK(total == 4 + VTP_NONCE_LEN + VTP_HEADER_LEN + 100 + VTP_TAG_LEN);
+  /* 4-byte BE length prefix = total - 4 */
+  CHECK(frame[0] == 0 && frame[1] == 0 &&
+        frame[2] == (guint8)((total - 4) >> 8) &&
+        frame[3] == (guint8)((total - 4) & 0xff));
+
+  guint8 out[256];
+  gsize out_len = 0;
+  guint16 mode = 0, st = 0, scene = 0;
+  guint32 ts = 0;
+  CHECK(vtp_parse_common_frame(frame, total, key, &mode, &st, &scene, &ts,
+                               out, sizeof(out), &out_len));
+  CHECK(mode == VTP_MODE_COMMON && st == 0 && scene == 0);
+  CHECK(ts == 123456789u);
+  CHECK(out_len == 100 && memcmp(out, data, 100) == 0);
+
+  /* wrong key → GCM tag failure */
+  CHECK(!vtp_parse_common_frame(frame, total, key_c, &mode, &st, &scene, &ts,
+                                out, sizeof(out), &out_len));
+  /* tampered ciphertext → GCM tag failure */
+  guint8 bad[512];
+  memcpy(bad, frame, total);
+  bad[4 + VTP_NONCE_LEN + 5] ^= 0x42;
+  CHECK(!vtp_parse_common_frame(bad, total, key, NULL, NULL, NULL, NULL, out,
+                                sizeof(out), &out_len));
+  /* truncated frame */
+  CHECK(!vtp_parse_common_frame(frame, total - 1, key, NULL, NULL, NULL,
+                                NULL, out, sizeof(out), &out_len));
+  /* length prefix inconsistent with the message */
+  memcpy(bad, frame, total);
+  bad[3] += 1;
+  CHECK(!vtp_parse_common_frame(bad, total, key, NULL, NULL, NULL, NULL, out,
+                                sizeof(out), &out_len));
+  /* output buffer too small */
+  CHECK(!vtp_parse_common_frame(frame, total, key, NULL, NULL, NULL, NULL,
+                                out, 50, &out_len));
+
+  /* empty payload */
+  guint8 frame0[64];
+  gsize t0 = vtp_build_common_frame(frame0, sizeof(frame0), key,
+                                    VTP_MODE_COMMON, 0, 0, 1, NULL, 0);
+  CHECK(t0 != (gsize)-1);
+  out_len = 0;
+  CHECK(vtp_parse_common_frame(frame0, t0, key, &mode, NULL, NULL, NULL, out,
+                               sizeof(out), &out_len));
+  CHECK(out_len == 0);
+
+  /* header field propagation: mode nibble, stream type, scene */
+  guint8 frame2[512];
+  gsize t2 = vtp_build_common_frame(frame2, sizeof(frame2), key, 3, 0x1234,
+                                    0x5678, 7, data, 10);
+  CHECK(t2 != (gsize)-1);
+  CHECK(vtp_parse_common_frame(frame2, t2, key, &mode, &st, &scene, &ts, out,
+                               sizeof(out), &out_len));
+  CHECK(mode == 3 && st == 0x1234 && scene == 0x5678 && ts == 7 &&
+        out_len == 10);
+
+  /* an ext-bit frame must be rejected by the stand (the public API never
+   * emits them, so forge one: seal a header with bit 28 set) */
+  guint8 plain2[VTP_HEADER_LEN + 4];
+  memset(plain2, 0, sizeof(plain2));
+  plain2[0] = (guint8)((VTP_FLAG_EXT_PRESENT >> 24) & 0xff);
+  plain2[1] = VTP_MODE_COMMON;
+  plain2[8] = 4; /* payloadLen = 4 */
+  memcpy(plain2 + VTP_HEADER_LEN, "abcd", 4);
+  guint8 nonce[VTP_NONCE_LEN];
+  for (guint i = 0; i < VTP_NONCE_LEN; i++) nonce[i] = (guint8)i;
+  gsize p2 = sizeof(plain2);
+  gsize f2 = 4 + VTP_NONCE_LEN + p2 + VTP_TAG_LEN;
+  guint8 fbuf[128];
+  fbuf[0] = 0;
+  fbuf[1] = 0;
+  fbuf[2] = (guint8)((f2 - 4) >> 8);
+  fbuf[3] = (guint8)((f2 - 4) & 0xff);
+  memcpy(fbuf + 4, nonce, VTP_NONCE_LEN);
+  CHECK(softbus_aes_gcm_encrypt(key, VTP_KEY_LEN, nonce, VTP_NONCE_LEN, NULL,
+                                0, plain2, p2, fbuf + 4 + VTP_NONCE_LEN,
+                                fbuf + f2 - VTP_TAG_LEN));
+  CHECK(!vtp_parse_common_frame(fbuf, f2, key, NULL, NULL, NULL, NULL, out,
+                                sizeof(out), &out_len));
+}
+
+/* ============================ h264 test file ============================ */
+
+static void test_h264_testfile(void) {
+  gchar *dir = g_build_filename(g_get_tmp_dir(), "hwphonelink-hs-test", NULL);
+  g_mkdir_with_parents(dir, 0755);
+
+  CHECK(!h264_testfile_generate(dir, 7, 4096, NULL, NULL)); /* below minimum */
+  CHECK(!h264_testfile_generate(NULL, 7, 40000, NULL, NULL));
+
+  gchar *path = NULL, *wire = NULL;
+  CHECK(h264_testfile_generate(dir, 7, 40000, &path, &wire));
+  CHECK(path != NULL && wire != NULL);
+  if (path != NULL && wire != NULL) {
+    /* wire-name convention */
+    CHECK(wire[0] == 'h' && wire[1] == 's' && wire[2] == '-');
+    CHECK(strlen(wire) == 3 + 64 + 5);
+    CHECK(g_str_has_suffix(wire, ".h264"));
+    gchar *want = h264_testfile_name_sha(wire);
+    CHECK(want != NULL && strlen(want) == 64);
+
+    gchar *data = NULL;
+    gsize len = 0;
+    CHECK(g_file_get_contents(path, &data, &len, NULL));
+    CHECK(len >= 8192 && len <= 40000 + 4108); /* budget ± one NAL */
+    if (len > 0) {
+      GChecksum *c = g_checksum_new(G_CHECKSUM_SHA256);
+      g_checksum_update(c, (const guchar *)data, (gssize)len);
+      if (want != NULL) CHECK(strcmp(g_checksum_get_string(c), want) == 0);
+      g_checksum_free(c);
+
+      /* protocol-level verify passes and reports the NAL structure */
+      gchar *det = NULL;
+      CHECK(h264_testfile_verify(path, wire, &det));
+      CHECK(det != NULL && strlen(det) > 0);
+      g_free(det);
+
+      /* start code at offset 0, first NAL = SPS */
+      CHECK(data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1);
+      CHECK((data[4] & 0x1f) == 7);
+
+      /* corrupt one byte on disk → sha mismatch → verify fails */
+      data[100] ^= 0x55;
+      CHECK(g_file_set_contents(path, (gchar *)data, (gssize)len, NULL));
+      det = NULL;
+      CHECK(!h264_testfile_verify(path, wire, &det));
+      g_free(det);
+    }
+    g_free(data);
+
+    /* deterministic per seed; different seed → different content */
+    gchar *path2 = NULL, *wire2 = NULL;
+    CHECK(h264_testfile_generate(dir, 7, 40000, &path2, &wire2));
+    CHECK(wire2 != NULL && strcmp(wire2, wire) == 0);
+    g_free(path2);
+    g_free(wire2);
+    CHECK(h264_testfile_generate(dir, 8, 40000, &path2, &wire2));
+    CHECK(wire2 != NULL && strcmp(wire2, wire) != 0);
+    g_free(path2);
+    g_free(wire2);
+  }
+  g_free(path);
+  g_free(wire);
+  g_free(dir);
+
+  /* name_sha parsing: strict "hs-<hex64>.h264" */
+  gchar *sha = h264_testfile_name_sha("hs-" "0123456789abcdef0123456789abcdef"
+                                      "0123456789abcdef0123456789abcdef.h264");
+  CHECK(sha != NULL && strlen(sha) == 64);
+  g_free(sha);
+  CHECK(h264_testfile_name_sha("xh-0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef.h264") ==
+        NULL);
+  CHECK(h264_testfile_name_sha("hs-z123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef.h264") ==
+        NULL); /* non-hex */
+  CHECK(h264_testfile_name_sha("hs-0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcde.h264") ==
+        NULL); /* 63 hex chars */
+  CHECK(h264_testfile_name_sha("hs-0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef.bin") ==
+        NULL);
+  CHECK(h264_testfile_name_sha(NULL) == NULL);
+}
+
 /* ============================ Main ============================ */
 
 int main(void) {
@@ -954,6 +1338,11 @@ int main(void) {
   test_dfile_ack_bad();
   test_dfile_rst_roundtrip();
   test_ft_testfile();
+  test_fillp_head();
+  test_fillp_mgmt_roundtrip();
+  test_fillp_cookie();
+  test_vtp_frame();
+  test_h264_testfile();
 
   g_mutex_clear(&test_lock);
   g_cond_clear(&test_cond);

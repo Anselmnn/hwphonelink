@@ -13,8 +13,15 @@
  *      deterministic test file (ft-<sha>.bin, verified by the daemon)
  *      and receives the daemon's reverse push (verified by the engine
  *      from the wire name) — bidirectional E2E. Skippable with --no-ft.
+ *   6. After the DFile phase, runs the fillp/VTP screen-streaming
+ *      phase (spec §8) as the fillp SERVER on UDP stream_port: receives
+ *      the daemon's file B and pushes file A (deterministic test file),
+ *      both content-verified. Skippable with --no-stream (implied by
+ *      --no-ft; the daemon triggers its stream phase off the DFile
+ *      phase, so both sides must agree).
  *
- * Exit codes: 0 = full handshake + echo + FT OK, 1 = failure/timeout.
+ * Exit codes: 0 = full handshake + echo + FT + stream OK,
+ *             1 = failure/timeout.
  */
 
 #include <glib.h>
@@ -33,9 +40,15 @@
 #include "proto/softbus_crypto.h"
 #include "proto/dfile_conn.h"
 #include "proto/ft_testfile.h"
+#include "proto/fillp_conn.h"
+#include "proto/stream_file.h"
+#include "proto/vtp_frame.h"
 
 #define MOCK_PING "P40-PING"
-#define MOCK_TIMEOUT_MS 45000
+/* Wall-clock budget for the whole mock run (auth + FT + stream, incl.
+ * up to 3 daemon fillp connect retries). Must stay under the E2E
+ * harness `timeout` (90 s). */
+#define MOCK_TIMEOUT_MS 80000
 #define MOCK_FT_SEED 1
 #define MOCK_FT_SIZE (1024 * 1024) /* 1 MiB = 713 blocks @ 1472, last 512 */
 
@@ -43,6 +56,8 @@ static GMainLoop *loop = NULL;
 static gint exit_code = 1;
 static SoftbusSession *session = NULL;
 static SoftbusAuth *auth = NULL;
+/* Pre-provisioned PSK; shared with the stream phase (VTP key derivation). */
+static gchar *psk = NULL;
 
 /* DFile phase state. The push is started from the engine thread
  * (on_ft_negotiated); results/closure fire there too and are marshalled
@@ -53,6 +68,17 @@ static volatile gint ft_pull_done = 0;
 static volatile gint ft_finished = 0;
 static guint ft_port = 54322;
 static gboolean skip_ft = FALSE;
+
+/* Stream phase (fillp server + VTP file session, spec §8). */
+static FillpEngine *stream_engine = NULL;
+static FillpPeer *stream_peer = NULL;
+static StreamFile *stream_sf = NULL;
+static volatile gint stream_tx_done = 0; /* file A pushed + acked */
+static volatile gint stream_rx_done = 0; /* file B received + verified */
+static volatile gint stream_failed = 0;
+static volatile gint stream_established = 0; /* fillp handshake done */
+static guint stream_port = 54324;
+static gboolean skip_stream = FALSE;
 
 /* Runs on the main thread (either directly from the timeout source, or
  * via g_main_context_invoke from the session pump thread). GSourceFunc. */
@@ -76,6 +102,145 @@ static void print_keys(const gchar *who) {
     g_print("mock-phone: [%s] data-key: %s\n", who, h);
     g_free(h);
   }
+}
+
+/* ============================ Stream phase (fillp + VTP) ============================
+ *
+ * After the DFile phase, the mock runs the fillp SERVER engine on
+ * stream_port (the daemon connects as the fillp client). One
+ * bidirectional StreamFile: push file A (deterministic test file,
+ * verified by the daemon from the wire name) and receive the daemon's
+ * file B (verified here).
+ *
+ * Engine callbacks fire on the fillp engine thread; they only marshal
+ * to the main loop via g_main_context_invoke().
+ */
+
+/* Marshalled: print + fail with @msg (takes ownership of the string). */
+static int stream_fail(gpointer msg) {
+  g_print("mock-phone: STREAM FAILED: %s\n", (const gchar *)msg);
+  g_free(msg);
+  return set_exit(GINT_TO_POINTER(1));
+}
+
+static void stream_fail_invoke(const gchar *reason) {
+  g_main_context_invoke_full(NULL, G_PRIORITY_DEFAULT, (GSourceFunc)stream_fail,
+                             g_strdup(reason), NULL);
+}
+
+/* One direction finished (fillp engine thread). */
+static void on_stream_done(StreamFile *sf, gboolean is_send, gboolean ok,
+                           const gchar *message, gpointer user_data) {
+  (void)sf;
+  (void)user_data;
+  g_print("mock-phone: STREAM %s %s: %s\n", is_send ? "push" : "pull",
+          ok ? "OK" : "FAILED", message);
+  g_free((gchar *)message);
+  if (!ok) {
+    g_atomic_int_set(&stream_failed, 1);
+    stream_fail_invoke("one-direction stream transfer failed");
+    return;
+  }
+  if (is_send)
+    g_atomic_int_set(&stream_tx_done, 1);
+  else
+    g_atomic_int_set(&stream_rx_done, 1);
+  if (stream_tx_done && stream_rx_done) {
+    g_print("mock-phone: STREAM E2E OK (push + pull verified)\n");
+    if (stream_peer != NULL) fillp_peer_close(stream_peer);
+    g_main_context_invoke(NULL, set_exit, GINT_TO_POINTER(0));
+  }
+}
+
+/* Handshake complete (fillp engine thread): start pushing file A and
+ * attach the receive side for the daemon's file B. */
+static void on_stream_established(FillpEngine *engine, FillpPeer *peer,
+                                  gpointer user_data) {
+  (void)engine;
+  (void)user_data;
+  g_atomic_int_set(&stream_established, 1);
+  stream_peer = peer;
+
+  /* File A: deterministic test content, self-describing name. */
+  gchar *dir =
+      g_build_filename(g_get_tmp_dir(), "hwphonelink-mock-stream-tx", NULL);
+  gchar *path = NULL;
+  gchar *wire_name = NULL;
+  if (g_mkdir_with_parents(dir, 0755) < 0 ||
+      !ft_testfile_generate(dir, MOCK_FT_SEED, MOCK_FT_SIZE, &path,
+                            &wire_name)) {
+    g_print("mock-phone: stream test file generation failed\n");
+    g_free(dir);
+    stream_fail_invoke("cannot generate stream test file");
+    return;
+  }
+  g_print("mock-phone: STREAM pushing %s (%u bytes)\n", wire_name,
+          (unsigned)MOCK_FT_SIZE);
+  g_free(dir);
+
+  guint8 key[VTP_KEY_LEN];
+  vtp_derive_key((const guint8 *)psk, strlen(psk), key);
+  stream_sf = stream_file_new(peer, key);
+  gchar *rxdir =
+      g_build_filename(g_get_tmp_dir(), "hwphonelink-mock-stream-rx", NULL);
+  g_mkdir_with_parents(rxdir, 0755);
+  stream_file_set_recv_dir(stream_sf, rxdir);
+  g_free(rxdir);
+  stream_file_set_callbacks(stream_sf, NULL, on_stream_done, NULL);
+
+  GError *err = NULL;
+  if (!stream_file_start_send(stream_sf, path, wire_name, &err)) {
+    g_print("mock-phone: stream push start failed: %s\n",
+            err ? err->message : "?");
+    g_clear_error(&err);
+    stream_file_close(stream_sf);
+    stream_sf = NULL;
+    stream_fail_invoke("stream push start failed");
+  }
+  g_free(path);
+  g_free(wire_name);
+}
+
+/* Peer teardown (fillp engine thread); the peer is dead after this. */
+static void on_stream_closed(FillpEngine *engine, FillpPeer *peer,
+                             const gchar *reason, gpointer user_data) {
+  (void)engine;
+  (void)user_data;
+  g_print("mock-phone: fillp peer closed: %s\n", reason);
+  if (stream_sf != NULL) {
+    stream_file_close(stream_sf);
+    stream_sf = NULL;
+  }
+  if (stream_peer == peer) stream_peer = NULL;
+  if (stream_failed) return; /* failure already reported */
+  if (stream_tx_done && stream_rx_done) return; /* normal completion */
+  if (!stream_established) {
+    /* The handshake never completed (lost datagram, server bring-up
+     * race, ...): the daemon retries the connect, so keep the fillp
+     * server listening. The overall timeout still bounds the wait. */
+    g_print("mock-phone: fillp handshake incomplete — waiting for the "
+            "daemon to retry\n");
+    return;
+  }
+  stream_fail_invoke("fillp session closed before stream completed");
+}
+
+/* Main loop thread (from ft_mark_done): bring up the fillp server. */
+static void start_stream(void) {
+  GError *err = NULL;
+  stream_engine = fillp_engine_new(stream_port, &err);
+  if (stream_engine == NULL) {
+    g_print("mock-phone: fillp engine start failed: %s\n",
+            err ? err->message : "unknown");
+    g_clear_error(&err);
+    stream_fail_invoke("fillp engine start failed");
+    return;
+  }
+  fillp_engine_set_callbacks(stream_engine, on_stream_established, NULL, NULL,
+                             on_stream_closed, NULL);
+  g_print("mock-phone: fillp server on UDP port %u (waiting for the "
+          "daemon)\n",
+          (unsigned)stream_port);
 }
 
 /* ============================ DFile phase ============================
@@ -102,12 +267,18 @@ static void ft_fail_invoke(const gchar *reason) {
                              g_strdup(reason), NULL);
 }
 
-/* Both directions verified → exit 0 (exactly once). */
+/* Both directions verified → stream phase (or exit 0 if skipped). */
 static int ft_mark_done(gpointer p) {
   (void)p;
   if (g_atomic_int_exchange(&ft_finished, 1)) return 0;
-  g_print("mock-phone: FT E2E OK (push + pull verified)\n");
-  return set_exit(GINT_TO_POINTER(0));
+  if (skip_stream) {
+    g_print("mock-phone: FT E2E OK (push + pull verified)\n");
+    return set_exit(GINT_TO_POINTER(0));
+  }
+  g_print("mock-phone: FT E2E OK (push + pull verified) — starting the "
+          "stream phase\n");
+  start_stream();
+  return 0;
 }
 
 static void on_ft_negotiated(DFileConn *dc, gpointer user_data) {
@@ -306,7 +477,7 @@ static void send_beacon(SoftbusDevice *dev, const gchar *server_ip) {
 
 static gboolean on_timeout(gpointer data) {
   (void)data;
-  g_print("mock-phone: timed out waiting for handshake/echo\n");
+  g_print("mock-phone: timed out waiting for handshake/echo/FT/stream\n");
   set_exit(GINT_TO_POINTER(1));
   return G_SOURCE_REMOVE;
 }
@@ -318,14 +489,16 @@ int main(int argc, char *argv[]) {
   gchar *server_ip = NULL;
   guint server_port = 54321;
   gint ft_port_opt = 54322;
-  gchar *psk = NULL;
+  gint stream_port_opt = 54324;
   gchar *device_id = "mock-phone-001";
 
   GOptionEntry entries[] = {
     {"server-ip", 0, 0, G_OPTION_ARG_STRING, &server_ip, "Daemon IP to connect to", "IP"},
     {"server-port", 0, 0, G_OPTION_ARG_INT, &server_port, "Daemon session TCP port (default 54321)", "PORT"},
     {"ft-port", 0, 0, G_OPTION_ARG_INT, &ft_port_opt, "Daemon DFile (file transfer) TCP port (default 54322)", "PORT"},
-    {"no-ft", 0, G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE, &skip_ft, "Skip the DFile transfer phase (session test only)", NULL},
+    {"stream-port", 0, 0, G_OPTION_ARG_INT, &stream_port_opt, "fillp (stream) UDP server port (default 54324)", "PORT"},
+    {"no-ft", 0, G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE, &skip_ft, "Skip the DFile transfer phase (session test only; also skips the stream phase)", NULL},
+    {"no-stream", 0, G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE, &skip_stream, "Skip the fillp/VTP stream phase (FT test only)", NULL},
     {"psk", 0, 0, G_OPTION_ARG_STRING, &psk, "Pre-provisioned PSK (default: test PSK)", "SECRET"},
     {"id", 0, 0, G_OPTION_ARG_STRING, &device_id, "Mock phone device id", "ID"},
     {NULL}
@@ -347,6 +520,13 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   ft_port = (guint)ft_port_opt;
+  if (stream_port_opt < 0) {
+    g_printerr("--stream-port must be >= 0\n");
+    return 1;
+  }
+  stream_port = (guint)stream_port_opt;
+  if (skip_ft)
+    skip_stream = TRUE; /* the daemon triggers its stream off the FT phase */
   if (psk == NULL) {
     psk = g_strdup(g_getenv("HWPONELINK_PSK"));
     if (psk == NULL || psk[0] == '\0') {
@@ -419,6 +599,11 @@ int main(int argc, char *argv[]) {
 
   /* Cleanup */
   g_print("mock-phone: exiting with code %d\n", exit_code);
+  if (stream_engine != NULL) {
+    fillp_engine_close(stream_engine);
+    fillp_engine_unref(stream_engine);
+    stream_engine = NULL;
+  }
   if (ft_dc) {
     dfile_conn_close(ft_dc);
     dfile_conn_unref(ft_dc);

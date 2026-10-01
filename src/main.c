@@ -21,6 +21,9 @@
 #include "proto/softbus_crypto.h"
 #include "proto/dfile_conn.h"
 #include "proto/ft_testfile.h"
+#include "proto/fillp_conn.h"
+#include "proto/stream_file.h"
+#include "proto/vtp_frame.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <signal.h>
@@ -84,6 +87,32 @@ static void ft_service_teardown(GSocketService *svc) {
 static gchar *ft_dir = NULL;
 static gchar *ft_send_spec = NULL;
 static guint ft_port = 0;
+
+/* Stream phase (fillp + VTP, spec §8): after the DFile phase the daemon
+ * starts a fillp UDP engine on stream_port (client role: it initiates
+ * the handshake against the peer's fillp server on stream_peer_port)
+ * and runs one bidirectional StreamFile — sends stream_send_spec
+ * (file B) and receives the peer's file (file A) into stream_dir.
+ * The stream_* flags live on the fillp engine thread; every engine
+ * action is marshalled to the main loop with g_main_context_invoke().
+ */
+static FillpEngine *stream_engine = NULL;
+static FillpPeer *stream_peer = NULL;
+static StreamFile *stream_sf = NULL;
+static gchar *ft_peer_ip = NULL; /* peer address learned from DFile */
+static guint stream_port = 54323;
+static guint stream_peer_port = 54324;
+static gchar *stream_dir = NULL;
+static gchar *stream_send_spec = NULL;
+#define STREAM_CONNECT_MAX 3
+static volatile gint stream_tx_done = 0;
+static volatile gint stream_rx_done = 0;
+static volatile gint stream_failed = 0;
+static volatile gint stream_established = 0;
+static volatile gint stream_attempts = 0;
+
+/* GSourceFunc, main loop; defined in the stream section below. */
+static int stream_start_invoke(gpointer data);
 
 static void signal_handler(int signum) {
   g_print("Received signal %d, shutting down...\n", signum);
@@ -317,6 +346,13 @@ static void on_ft_result(DFileConn *dc, gboolean is_sender, gboolean ok,
   (void)user_data;
   g_print("FT: %s transfer %s: %s\n", is_sender ? "send" : "recv",
           ok ? "OK" : "FAILED", msg);
+  /* Stand sync point: once our reverse push is fully acked the peer's
+   * DFile phase is over and its fillp server is (about to be) up —
+   * start the stream phase from the main loop. */
+  if (is_sender && ok && stream_port > 0 && !stream_failed &&
+      !stream_established) {
+    g_main_context_invoke(NULL, stream_start_invoke, NULL);
+  }
 }
 
 static void on_ft_closed(DFileConn *dc, gpointer user_data) {
@@ -347,11 +383,16 @@ static gboolean on_ft_connection(GSocketService *service,
   g_clear_error(&aerr);
   g_print("FT: DFile session from %s\n", ip ? ip : "?");
 
+  /* Remember the peer address: the stream phase (fillp connect) needs
+   * it, and the DFile session is what tells us who the peer is. */
+  g_free(ft_peer_ip);
+  ft_peer_ip = ip;
+  ip = NULL;
+
   DFileConn *dc = dfile_conn_new_server(conn);
   if (dc == NULL) {
     g_print("FT: engine start failed\n");
     g_object_unref(conn);
-    g_free(ip);
     return TRUE;
   }
   FtSession *s = g_new0(FtSession, 1);
@@ -360,6 +401,189 @@ static gboolean on_ft_connection(GSocketService *service,
                            on_ft_result, on_ft_closed, s);
   g_free(ip);
   return TRUE;
+}
+
+/* ============================ Stream (fillp + VTP) ============================
+ *
+ * Replay-stand screen-streaming phase (spec §8): after the DFile phase
+ * completes, the daemon starts a fillp UDP engine on stream_port and
+ * plays the CLIENT role against the peer's fillp server
+ * (stream_peer_port). One bidirectional StreamFile runs on the
+ * connection: the daemon sends stream_send_spec (file B) and receives
+ * the peer's file (file A) into stream_dir.
+ *
+ * Engine callbacks fire on the fillp engine thread; all engine actions
+ * are marshalled to the main loop with g_main_context_invoke().
+ */
+
+static void stream_connect(void);
+static gboolean stream_retry_timeout(gpointer data);
+
+/* Main thread. One client connect per call; a failed synchronous
+ * connect schedules a 1 s retry (the peer's server may still be
+ * binding), a lost handshake arrives later as on_closed and is
+ * retried the same way. */
+static void stream_connect(void) {
+  if (stream_engine == NULL) return;
+  if (ft_peer_ip == NULL) {
+    g_print("STREAM: no peer address (the DFile phase did not run)\n");
+    g_atomic_int_set(&stream_failed, 1);
+    return;
+  }
+  g_atomic_int_inc(&stream_attempts);
+  if (stream_attempts > STREAM_CONNECT_MAX) {
+    g_print("STREAM: giving up after %d connect attempts\n",
+            STREAM_CONNECT_MAX);
+    g_atomic_int_set(&stream_failed, 1);
+    return;
+  }
+  GError *err = NULL;
+  FillpPeer *p = fillp_engine_connect(stream_engine, ft_peer_ip,
+                                      stream_peer_port, &err);
+  if (p == NULL) {
+    g_print("STREAM: connect %s:%u attempt %d failed: %s\n", ft_peer_ip,
+            (unsigned)stream_peer_port, (int)stream_attempts,
+            err ? err->message : "unknown");
+    g_clear_error(&err);
+    g_timeout_add_seconds(1, stream_retry_timeout, NULL);
+  } else {
+    g_print("STREAM: fillp connect to %s:%u (attempt %d)\n", ft_peer_ip,
+            (unsigned)stream_peer_port, (int)stream_attempts);
+  }
+}
+
+static gboolean stream_retry_timeout(gpointer data) {
+  (void)data;
+  stream_connect();
+  return G_SOURCE_REMOVE;
+}
+
+/* One direction finished (fillp engine thread). */
+static void on_stream_done(StreamFile *sf, gboolean is_send, gboolean ok,
+                           const gchar *message, gpointer user_data) {
+  (void)sf;
+  (void)user_data;
+  g_print("STREAM: %s %s: %s\n", is_send ? "send" : "recv",
+          ok ? "OK" : "FAILED", message);
+  g_free((gchar *)message);
+  if (!ok) {
+    g_atomic_int_set(&stream_failed, 1);
+    return;
+  }
+  if (is_send)
+    g_atomic_int_set(&stream_tx_done, 1);
+  else
+    g_atomic_int_set(&stream_rx_done, 1);
+  if (stream_tx_done && stream_rx_done) {
+    g_print("STREAM: both directions verified — closing fillp peer\n");
+    if (stream_peer != NULL) fillp_peer_close(stream_peer);
+  }
+}
+
+/* Handshake complete (fillp engine thread): attach the StreamFile. */
+static void on_stream_established(FillpEngine *engine, FillpPeer *peer,
+                                  gpointer user_data) {
+  (void)engine;
+  (void)user_data;
+  g_atomic_int_set(&stream_established, 1);
+  stream_peer = peer;
+
+  guint8 key[VTP_KEY_LEN];
+  vtp_derive_key((const guint8 *)psk, strlen(psk), key);
+  stream_sf = stream_file_new(peer, key);
+  stream_file_set_recv_dir(stream_sf, stream_dir);
+  stream_file_set_callbacks(stream_sf, NULL, on_stream_done, NULL);
+
+  /* Resolve the send spec ("none"/empty = receive-only). */
+  gchar *path = NULL;
+  gchar *wire_name = NULL;
+  gboolean sending = stream_send_spec != NULL && *stream_send_spec != '\0' &&
+                     g_strcmp0(stream_send_spec, "none") != 0;
+  if (sending) {
+    if (g_str_has_prefix(stream_send_spec, "gen:")) {
+      gchar **parts = g_strsplit(stream_send_spec, ":", 3);
+      gboolean ok = parts[1] != NULL && parts[2] != NULL && parts[1][0] &&
+                    parts[2][0];
+      guint64 seed = ok ? g_ascii_strtoull(parts[1], NULL, 10) : 0;
+      guint64 size = ok ? g_ascii_strtoull(parts[2], NULL, 10) : 0;
+      gchar *dir =
+          g_build_filename(g_get_tmp_dir(), "hwphonelink-streamgen", NULL);
+      if (ok && g_mkdir_with_parents(dir, 0755) >= 0 &&
+          ft_testfile_generate(dir, seed, size, &path, &wire_name)) {
+        g_print("STREAM: generating send file %s (%" G_GUINT64_FORMAT
+                " bytes, seed %" G_GUINT64_FORMAT ")\n",
+                wire_name, size, seed);
+      }
+      g_free(dir);
+      g_strfreev(parts);
+    } else {
+      path = g_strdup(stream_send_spec);
+      wire_name = g_strdup(g_path_get_basename(stream_send_spec));
+    }
+  }
+  if (path == NULL) {
+    g_print("STREAM: receive-only session (no send spec)\n");
+    stream_file_attach(stream_sf);
+    return;
+  }
+  GError *err = NULL;
+  if (!stream_file_start_send(stream_sf, path, wire_name, &err)) {
+    g_print("STREAM: start send failed: %s\n", err ? err->message : "?");
+    g_clear_error(&err);
+    g_atomic_int_set(&stream_failed, 1);
+    stream_file_attach(stream_sf); /* keep the receive direction live */
+  }
+  g_free(path);
+  g_free(wire_name);
+}
+
+/* Peer teardown (fillp engine thread); the peer is dead after this. */
+static void on_stream_closed(FillpEngine *engine, FillpPeer *peer,
+                             const gchar *reason, gpointer user_data) {
+  (void)engine;
+  (void)user_data;
+  g_print("STREAM: fillp peer closed: %s\n", reason);
+  if (stream_sf != NULL) {
+    stream_file_close(stream_sf);
+    stream_sf = NULL;
+  }
+  if (stream_peer == peer) stream_peer = NULL;
+
+  if (stream_failed || (stream_tx_done && stream_rx_done)) return;
+  if (stream_established) {
+    g_print("STREAM: session closed before both directions completed\n");
+    g_atomic_int_set(&stream_failed, 1);
+    return;
+  }
+  /* Handshake never completed (the peer's fillp server was probably not
+   * bound yet): retry the connect from the main thread. */
+  g_main_context_invoke(NULL, stream_start_invoke, NULL);
+}
+
+/* Main thread: create the engine (once) and start the client connect. */
+static void stream_start(void) {
+  if (stream_failed) return;
+  if (stream_engine == NULL) {
+    GError *err = NULL;
+    stream_engine = fillp_engine_new(stream_port, &err);
+    if (stream_engine == NULL) {
+      g_printerr("STREAM: cannot start fillp engine on UDP port %u: %s\n",
+                 (unsigned)stream_port, err ? err->message : "unknown");
+      g_clear_error(&err);
+      g_atomic_int_set(&stream_failed, 1);
+      return;
+    }
+    fillp_engine_set_callbacks(stream_engine, on_stream_established, NULL,
+                               NULL, on_stream_closed, NULL);
+    g_print("STREAM: fillp engine on UDP port %u\n", (unsigned)stream_port);
+  }
+  stream_connect();
+}
+
+static int stream_start_invoke(gpointer data) {
+  (void)data;
+  stream_start();
+  return 0;
 }
 
 static SoftbusDevice* build_local_device(const gchar *device_id) {
@@ -382,6 +606,8 @@ int main(int argc, char *argv[]) {
   gboolean use_infra = FALSE;
   gchar *device_id = NULL;
   gint ft_port_opt = 54322;
+  gint stream_port_opt = 54323;
+  gint stream_peer_port_opt = 54324;
 
   GOptionEntry entries[] = {
     {"phy", 'p', 0, G_OPTION_ARG_STRING, &phy_name, "Physical interface name (e.g., phy0)", "PHY"},
@@ -393,6 +619,10 @@ int main(int argc, char *argv[]) {
     {"ft-port", 0, 0, G_OPTION_ARG_INT, &ft_port_opt, "DFile (file transfer) TCP port, 0 disables the listener (default 54322)", "PORT"},
     {"ft-dir", 0, 0, G_OPTION_ARG_STRING, &ft_dir, "Directory for received files (default: ./ft-received)", "DIR"},
     {"ft-send", 0, 0, G_OPTION_ARG_STRING, &ft_send_spec, "Auto-send after receiving: PATH, or gen:<seed>:<size> for a deterministic test file (default: off)", "SPEC"},
+    {"stream-port", 0, 0, G_OPTION_ARG_INT, &stream_port_opt, "fillp (stream) UDP client port, 0 disables streaming (default 54323)", "PORT"},
+    {"stream-peer-port", 0, 0, G_OPTION_ARG_INT, &stream_peer_port_opt, "Peer's fillp (stream) UDP server port (default 54324)", "PORT"},
+    {"stream-dir", 0, 0, G_OPTION_ARG_STRING, &stream_dir, "Directory for stream-received files (default: ./stream-received)", "DIR"},
+    {"stream-send", 0, 0, G_OPTION_ARG_STRING, &stream_send_spec, "File to send over the stream: PATH, or gen:<seed>:<size> for a deterministic test file (default: gen:2:1048576 when streaming is enabled; \"none\" = receive-only)", "SPEC"},
     {NULL}
   };
 
@@ -417,6 +647,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   ft_port = (guint)ft_port_opt;
+  if (stream_port_opt < 0 || stream_peer_port_opt < 0) {
+    g_printerr("--stream-port/--stream-peer-port must be >= 0\n");
+    return 1;
+  }
+  stream_port = (guint)stream_port_opt;
+  stream_peer_port = (guint)stream_peer_port_opt;
   if (device_id == NULL) {
     device_id = g_strdup("hwphonelink-pc-001");
   }
@@ -511,12 +747,35 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Stream (fillp + VTP) phase configuration
+  if (stream_port > 0) {
+    if (stream_dir == NULL) stream_dir = g_strdup("stream-received");
+    if (g_mkdir_with_parents(stream_dir, 0755) < 0) {
+      g_printerr("Cannot create stream receive dir %s: %s\n", stream_dir,
+                 g_strerror(errno));
+      return 1;
+    }
+    if (stream_send_spec == NULL)
+      stream_send_spec = g_strdup("gen:2:1048576");
+    g_print("STREAM: fillp client will start on UDP port %u after the DFile "
+            "phase (send: %s, recv dir: %s)\n",
+            (unsigned)stream_port, stream_send_spec, stream_dir);
+    if (ft_port == 0)
+      g_print("STREAM: warning: the stream phase is triggered after the DFile "
+              "phase; with --ft-port 0 it will never start\n");
+  }
+
   // Run main loop
   main_loop = g_main_loop_new(NULL, FALSE);
   g_main_loop_run(main_loop);
 
   // Cleanup
   g_print("Stopping transport...\n");
+  if (stream_engine != NULL) {
+    fillp_engine_close(stream_engine);
+    fillp_engine_unref(stream_engine);
+    stream_engine = NULL;
+  }
   if (ft_service) {
     ft_service_teardown(ft_service);
     ft_service = NULL;
@@ -529,6 +788,9 @@ int main(int argc, char *argv[]) {
   g_free(device_id);
   g_free(ft_dir);
   g_free(ft_send_spec);
+  g_free(ft_peer_ip);
+  g_free(stream_dir);
+  g_free(stream_send_spec);
 
   g_print("Daemon stopped\n");
   return 0;
