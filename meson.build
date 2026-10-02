@@ -16,6 +16,9 @@ dep_gio = dependency('gio-2.0', required: true)
 dep_gobject = dependency('gobject-2.0', required: true)
 dep_json_glib = dependency('json-glib-1.0', required: true)
 dep_openssl = dependency('openssl', required: true)
+dep_gstreamer = dependency('gstreamer-1.0', required: true)
+dep_gstapp = dependency('gstreamer-app-1.0', required: true)
+dep_gtk3 = dependency('gtk+-3.0', required: true)
 
 # Threads
 thread_dep = dependency('threads')
@@ -76,6 +79,9 @@ headers = [
   'src/proto/vtp_frame.h',
   'src/proto/h264_testfile.h',
   'src/proto/stream_file.h',
+  'src/proto/remote_input.h',
+  'src/proto/dmsdp.h',
+  'src/mirror_player.h',
 ]
 
 inc = include_directories('src')
@@ -96,6 +102,8 @@ proto_sources = [
   'src/proto/vtp_frame.c',
   'src/proto/h264_testfile.c',
   'src/proto/stream_file.c',
+  'src/proto/remote_input.c',
+  'src/proto/dmsdp.c',
 ]
 
 proto_lib = library(
@@ -129,6 +137,7 @@ transport_lib = library(
 # Main daemon
 daemon_sources = [
   'src/main.c',
+  'src/mirror_player.c',
 ]
 
 daemon = executable(
@@ -136,7 +145,8 @@ daemon = executable(
   daemon_sources,
   link_with: [transport_lib, proto_lib],
   include_directories: inc,
-  dependencies: [dep_libnl3, dep_libnl_genl, dep_glib, dep_gio, dep_gobject, thread_dep],
+  dependencies: [dep_libnl3, dep_libnl_genl, dep_glib, dep_gio, dep_gobject,
+                 dep_gstreamer, dep_gstapp, dep_gtk3, thread_dep],
   install: true,
   install_dir: bindir,
 )
@@ -162,6 +172,10 @@ mock_phone = executable(
   link_with: proto_lib,
   include_directories: inc,
   dependencies: [dep_glib, dep_gio, thread_dep],
+  # M3 (spec §8.7): file A of the stream phase is the committed H.264
+  # mirror clip; the fallback path is the source-tree location.
+  c_args: ['-DMIRROR_CLIP_DEFAULT="' +
+           meson.current_source_dir() / 'tests/data/mirror-testsrc.h264' + '"'],
   install: true,
   install_dir: bindir,
 )

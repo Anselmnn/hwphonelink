@@ -153,35 +153,56 @@ gboolean h264_testfile_verify(const gchar *path, const gchar *wire_name,
   }
   g_free(expected_sha);
 
-  /* 2. start-code scan: the first code is at offset 0; every 00 00 00 01
-   * is a NAL start (emulation prevention rules out in-payload matches). */
-  if (len < 5 || data[0] != 0 || data[1] != 0 || data[2] != 0 ||
-      data[3] != 0x01) {
-    g_string_append(details, "no start code at file head");
-    ok = FALSE;
-  }
-
+  /* 2. Annex-B scan: a start code is 00 00 01, optionally preceded by an
+   * extra zero (4-byte code); the NAL header byte follows the 01. Emulation
+   * prevention (00 00 03) rules out in-payload matches. Required structure
+   * (stand clips, spec §8.7): SPS, PPS, optional SEI, an IDR slice before
+   * the first non-IDR slice. */
+  gssize first_nal = -1;
   guint nals = 0;
   guint8 first_types[3] = {0, 0, 0};
-  gboolean types_ok = TRUE;
-  for (gsize i = 0; i + 4 < len; i++) {
-    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 &&
-        data[i + 3] == 0x01) {
-      if (nals < 3) first_types[nals] = (guint8)(data[i + 4] & 0x1f);
-      else if ((data[i + 4] & 0x1f) != 1) types_ok = FALSE; /* non-IDR */
+  guint st = 0; /* 0=expect SPS 1=expect PPS 2=pre-IDR 3=body */
+  for (gsize i = 0; i + 2 < len; i++) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      guint8 t = (guint8)(data[i + 3] & 0x1f);
+      if (first_nal < 0) first_nal = (gssize)i;
+      if (nals < 3) first_types[nals] = t;
+      switch (st) {
+      case 0:
+        st = (t == 7) ? 1 : 100;
+        break;
+      case 1:
+        st = (t == 8) ? 2 : 100;
+        break;
+      case 2:
+        if (t == 5)
+          st = 3;
+        else if (t != 6)
+          st = 100;
+        break;
+      case 3:
+        /* SPS/PPS may be re-emitted before a later IDR (keyint) */
+        if (t != 1 && t != 5 && t != 6 && t != 7 && t != 8) st = 100;
+        break;
+      default:
+        break;
+      }
       nals++;
-      i += 3; /* resume scan after the code */
+      i += 2; /* resume after the 01 byte */
     }
   }
-  if (nals < 3 || first_types[0] != 7 || first_types[1] != 8 ||
-      first_types[2] != 5 || !types_ok) {
+  if (first_nal != 0 && first_nal != 1) {
+    ok = FALSE;
+    g_string_append(details, "no start code at file head; ");
+  }
+  if (st != 3 || nals < 3) {
     ok = FALSE;
     g_string_append_printf(
         details, "bad NAL structure: %u NALs, first types %u/%u/%u", nals,
         first_types[0], first_types[1], first_types[2]);
   } else {
-    g_string_append_printf(details, "%u NALs (SPS+PPS+IDR+%u non-IDR), "
-                                   "start codes ok", nals, nals - 3);
+    g_string_append_printf(details, "%u NALs (SPS+PPS+IDR-led), "
+                                   "start codes ok", nals);
   }
 
   g_free(data);

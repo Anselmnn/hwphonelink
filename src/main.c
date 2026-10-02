@@ -21,9 +21,13 @@
 #include "proto/softbus_crypto.h"
 #include "proto/dfile_conn.h"
 #include "proto/ft_testfile.h"
+#include "proto/dmsdp.h"
 #include "proto/fillp_conn.h"
+#include "proto/h264_testfile.h"
+#include "proto/remote_input.h"
 #include "proto/stream_file.h"
 #include "proto/vtp_frame.h"
+#include "mirror_player.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <signal.h>
@@ -111,6 +115,29 @@ static volatile gint stream_failed = 0;
 static volatile gint stream_established = 0;
 static volatile gint stream_attempts = 0;
 
+/*
+ * M3 (spec §8.7): DMSDP control session on the dsoftbus session socket
+ * plus the mirror plane.
+ *
+ *   - At auth completion the daemon (client) sends SETUP (CSeq 0,
+ *     client_port = its fillp client port). The mock phone replies
+ *     SetupReply (combined Transport, server_port) and the daemon sends
+ *     PLAY (CSeq 1); on the CommonReply the client FSM reaches READY.
+ *   - At READY the daemon sends the deterministic 12-event RemoteCtrl
+ *     input sequence (PC -> phone only) over the session; the mock
+ *     verifies it byte-exact.
+ *   - When the received stream file is the H.264 clip (wire name
+ *     hs-<sha>.h264) the main loop runs the mirror player on it.
+ *
+ * dmsdp_cl lives on the session pump thread (created at auth
+ * completion, fed by on_session_data); the flags are atomics.
+ */
+static DmsdpClient *dmsdp_cl = NULL;
+static volatile gint dmsdp_ready = 0;
+static volatile gint dmsdp_failed = 0;
+static guint dmsdp_client_port = 54323; /* = stream_port (fillp client) */
+static gchar *stream_rx_name = NULL;    /* fillp engine thread */
+
 /* GSourceFunc, main loop; defined in the stream section below. */
 static int stream_start_invoke(gpointer data);
 
@@ -170,10 +197,143 @@ static void print_hex(const gchar *label, const guint8 *data, gsize len) {
   g_free(hex);
 }
 
+/* ============================ DMSDP control (M3, spec §8.7) ============================
+ *
+ * All functions below run on the session pump thread (on_session_data).
+ * The mock phone is the DMSDP server: it answers the SETUP with a
+ * SetupReply (combined Transport, server_port = its fillp server port)
+ * and the PLAY with a CommonReply; the pinned wire strings are
+ * byte-verified on both sides (spec §8.7).
+ */
+
+#define DMSDP_STAND_SERVICE "hwphonelink-mirror"
+#define DMSDP_INPUT_EVENTS 12
+
+/* Deterministic PC -> phone input sequence (spec §6.4/§8.7): covers all
+ * live RemoteCtrl types; the byte-exact totals are 28/28/28/26/26/26/20/
+ * 22/24/22/24/24 and the mock phone verifies every packet byte by byte.
+ * Timestamps are ts = 1000 + 16*i. */
+static void send_input_sequence(SoftbusSession *session) {
+  static const RemoteInputEvent events[DMSDP_INPUT_EVENTS] = {
+      [0] = {.type = REMOTE_INPUT_TOUCH, .subtype = 0, .touch_cnt = 1,
+             .touch_ids = {1}, .touch_x = {1234.0}, .touch_y = {5678.0}},
+      [1] = {.type = REMOTE_INPUT_TOUCH, .subtype = 1, .touch_cnt = 1,
+             .touch_ids = {1}, .touch_x = {1300.0}, .touch_y = {5700.0}},
+      [2] = {.type = REMOTE_INPUT_TOUCH, .subtype = 2, .touch_cnt = 1,
+             .touch_ids = {1}, .touch_x = {1300.0}, .touch_y = {5700.0}},
+      [3] = {.type = REMOTE_INPUT_KEY, .subtype = 0, .key_f16a = 0x0001},
+      [4] = {.type = REMOTE_INPUT_KEY, .subtype = 1, .key_f16a = 0x0001},
+      [5] = {.type = REMOTE_INPUT_MOUSE, .subtype = 1, .mouse_button = 0,
+             .mouse_x = 100.5, .mouse_y = 200.25, .mouse_z = 0.0,
+             .mouse_w = 6250.0},
+      [6] = {.type = REMOTE_INPUT_SCROLL, .subtype = 0, .scroll_axis = 0,
+             .scroll_delta = 3},
+      [7] = {.type = REMOTE_INPUT_VKEY, .subtype = 0, .vkey_x = 0.0,
+             .vkey_y = 0.0},
+      [8] = {.type = REMOTE_INPUT_WHEEL, .subtype = 0, .wheel_dir = 1},
+      [9] = {.type = REMOTE_INPUT_INPUT7, .subtype = 0, .content = "hi",
+             .content_len = 2},
+      [10] = {.type = REMOTE_INPUT_MESSAGE, .subtype = 0, .msg_len = 5,
+              .msg_payload = (const guint8 *)"hi!"},
+      [11] = {.type = REMOTE_INPUT_ZOOM, .subtype = 0, .zoom_x = 10.0,
+              .zoom_y = 20.0, .zoom_pressure = 1.0},
+  };
+
+  for (guint i = 0; i < DMSDP_INPUT_EVENTS; i++) {
+    guint8 pkt[REMOTE_INPUT_MAX_TOTAL];
+    gsize n = 0;
+    GError *err = NULL;
+    if (remote_input_build(&events[i], 1000 + 16 * i, pkt, sizeof(pkt),
+                           &n) != 0) {
+      g_print("MIRROR INPUT: event %u build failed\n", (unsigned)i);
+      g_atomic_int_set(&dmsdp_failed, 1);
+      return;
+    }
+    if (!softbus_session_send(session, pkt, n, &err)) {
+      g_print("MIRROR INPUT: event %u send failed: %s\n", (unsigned)i,
+              err != NULL ? err->message : "?");
+      g_clear_error(&err);
+      g_atomic_int_set(&dmsdp_failed, 1);
+      return;
+    }
+  }
+  g_print("MIRROR INPUT: sent %d RemoteCtrl events (deterministic "
+          "sequence, spec 6.4)\n",
+          DMSDP_INPUT_EVENTS);
+}
+
+/* Start the DMSDP control session: send the SETUP (CSeq 0). */
+static void dmsdp_send_setup(SoftbusSession *session) {
+  DmsdpMsg msg;
+  guint8 wire[3 + DMSDP_TEXT_MAX];
+  gsize n = 0;
+  GError *err = NULL;
+
+  dmsdp_msg_setup(&msg, 0, DMSDP_STAND_SERVICE, 0, 1, 0, dmsdp_client_port,
+                  dmsdp_client_port);
+  if (dmsdp_client_send(dmsdp_cl, &msg, wire, sizeof(wire), &n) != 0) {
+    g_print("DMSDP: SETUP build failed\n");
+    g_atomic_int_set(&dmsdp_failed, 1);
+    return;
+  }
+  if (!softbus_session_send(session, wire, n, &err)) {
+    g_print("DMSDP: SETUP send failed: %s\n",
+            err != NULL ? err->message : "?");
+    g_clear_error(&err);
+    g_atomic_int_set(&dmsdp_failed, 1);
+    return;
+  }
+  g_print("DMSDP: SETUP sent (CSeq 0, client_port=%u-%u)\n",
+          (unsigned)dmsdp_client_port, (unsigned)dmsdp_client_port);
+}
+
+/* Feed a parsed reply to the client FSM and act on the transition:
+ * SEND_PLAY -> send the PLAY (CSeq 1); READY -> input sequence. */
+static void dmsdp_handle_reply(SoftbusSession *session,
+                               const DmsdpParsed *p) {
+  if (dmsdp_client_recv(dmsdp_cl, p) != 0) {
+    g_print("DMSDP: reply rejected by the client FSM\n");
+    g_atomic_int_set(&dmsdp_failed, 1);
+    return;
+  }
+  switch (dmsdp_client_state(dmsdp_cl)) {
+  case DMSDP_CL_SEND_PLAY: {
+    DmsdpMsg msg;
+    guint8 wire[3 + DMSDP_TEXT_MAX];
+    gsize n = 0;
+    GError *err = NULL;
+    dmsdp_msg_play(&msg, 1, DMSDP_STAND_SERVICE, 0, 1);
+    if (dmsdp_client_send(dmsdp_cl, &msg, wire, sizeof(wire), &n) != 0) {
+      g_print("DMSDP: PLAY build failed\n");
+      g_atomic_int_set(&dmsdp_failed, 1);
+      return;
+    }
+    if (!softbus_session_send(session, wire, n, &err)) {
+      g_print("DMSDP: PLAY send failed: %s\n",
+              err != NULL ? err->message : "?");
+      g_clear_error(&err);
+      g_atomic_int_set(&dmsdp_failed, 1);
+      return;
+    }
+    g_print("DMSDP: SetupReply OK — PLAY sent (CSeq 1)\n");
+    break;
+  }
+  case DMSDP_CL_READY:
+    g_atomic_int_set(&dmsdp_ready, 1);
+    g_print("DMSDP: CommonReply OK — control session READY\n");
+    send_input_sequence(session);
+    break;
+  default:
+    break; /* WAIT_*: the reply was consumed, nothing to send yet */
+  }
+}
+
 /*
  * Session data callback (runs on the session pump thread).
  * Before auth completes: feeds frames to the auth FSM and sends replies.
- * After auth completes: echoes payloads back (replay stand).
+ * After auth completes (M3): DMSDP NoCrypto frames ([0x00][u16 BE N]
+ * [text]) are fed to the control client FSM; anything else (the mock's
+ * P40-PING) is echoed back (the M2 session net).
  */
 static void on_session_data(SoftbusSession *session,
                             const guint8 *data, gsize len,
@@ -182,10 +342,31 @@ static void on_session_data(SoftbusSession *session,
   if (auth == NULL) return;
 
   if (softbus_auth_get_state(auth) == SOFTBUS_AUTH_STATE_DONE) {
-    /* Post-auth: echo the payload (validates the session data path). */
+    /* Post-auth (M3): a DMSDP NoCrypto frame is control traffic — feed
+     * it to the client FSM instead of echoing it. A RemoteCtrl packet
+     * never arrives here (input is PC -> phone only), so any other
+     * payload is the mock's P40-PING and keeps the M2 echo path. */
+    if (dmsdp_cl != NULL &&
+        dmsdp_client_state(dmsdp_cl) != DMSDP_CL_ERROR && len >= 3 &&
+        data[0] == DMSDP_FRAME_TYPE_NOCRYPTO) {
+      guint16 n = (guint16)(((guint)data[1] << 8) | data[2]);
+      if (n <= DMSDP_FRAME_MAX_PAYLOAD && (gsize)(3 + n) == len) {
+        DmsdpParsed parsed;
+        dmsdp_parsed_init(&parsed);
+        if (dmsdp_parse((const gchar *)(data + 3), n, &parsed) == 0) {
+          dmsdp_handle_reply(session, &parsed);
+          dmsdp_parsed_free(&parsed);
+          return;
+        }
+        dmsdp_parsed_free(&parsed);
+        g_print("DMSDP: received frame did not parse (len %u)\n", (unsigned)n);
+        g_atomic_int_set(&dmsdp_failed, 1);
+        return;
+      }
+    }
     GError *err = NULL;
     if (!softbus_session_send(session, data, len, &err)) {
-      g_print("Session echo failed: %s\n", err ? err->message : "?");
+      g_print("Session echo failed: %s\n", err != NULL ? err->message : "?");
       g_clear_error(&err);
     }
     return;
@@ -215,6 +396,17 @@ static void on_session_data(SoftbusSession *session,
                 softbus_auth_get_key_len(auth));
       print_hex("  data-key", softbus_auth_get_data_key(auth),
                 softbus_auth_get_key_len(auth));
+      /*
+       * M3: start the DMSDP control session on the session socket
+       * (the socket stays open through the FT and stream phases — the
+       * fillp plane rides a separate UDP connection). The SETUP's
+       * client_port is the daemon's fillp client port.
+       */
+      if (stream_port > 0) {
+        dmsdp_cl = dmsdp_client_new();
+        dmsdp_client_port = stream_port;
+        dmsdp_send_setup(session);
+      }
       break;
     }
     case SOFTBUS_AUTH_RESULT_FAILED:
@@ -458,6 +650,44 @@ static gboolean stream_retry_timeout(gpointer data) {
   return G_SOURCE_REMOVE;
 }
 
+/*
+ * M3: received the metadata frame of the peer's file (fillp engine
+ * thread). Remember the wire name: on completion a hs-<sha>.h264 name
+ * means the file is the mirror clip and gets decoded.
+ */
+static void on_stream_rx_meta(StreamFile *sf, const gchar *name,
+                              guint64 size, gpointer user_data) {
+  (void)sf;
+  (void)user_data;
+  g_free(stream_rx_name);
+  stream_rx_name = g_strdup(name);
+  g_print("STREAM: receiving %s (%" G_GUINT64_FORMAT " bytes)\n", name, size);
+}
+
+typedef struct {
+  gchar *path;
+  gchar *name;
+} MirrorJob;
+
+/* Main loop: run the mirror player on the received clip. */
+static int mirror_decode_invoke(gpointer data) {
+  MirrorJob *job = (MirrorJob *)data;
+  guint64 frames = 0;
+  gint rc = mirror_player_play_file(job->path, &frames);
+  if (rc == 0)
+    g_print("MIRROR: decoded %" G_GUINT64_FORMAT " frames from %s — "
+            "mirror E2E OK\n",
+            frames, job->name);
+  else
+    g_print("MIRROR: decode FAILED for %s (%" G_GUINT64_FORMAT
+            " frames before failure)\n",
+            job->name, frames);
+  g_free(job->path);
+  g_free(job->name);
+  g_free(job);
+  return 0;
+}
+
 /* One direction finished (fillp engine thread). */
 static void on_stream_done(StreamFile *sf, gboolean is_send, gboolean ok,
                            const gchar *message, gpointer user_data) {
@@ -478,6 +708,23 @@ static void on_stream_done(StreamFile *sf, gboolean is_send, gboolean ok,
     g_print("STREAM: both directions verified — closing fillp peer\n");
     if (stream_peer != NULL) fillp_peer_close(stream_peer);
   }
+  /*
+   * M3: the peer's file follows the hs-<sha>.h264 wire convention — it
+   * is the mirror clip (already sha/structure-verified by stream_file).
+   * Decode it on the main loop (GStreamer needs the main context).
+   */
+  if (!is_send && stream_rx_name != NULL &&
+      h264_testfile_name_sha(stream_rx_name) != NULL) {
+    gchar *name = g_strdup(stream_rx_name);
+    gchar *path = g_build_filename(stream_dir, name, NULL);
+    g_free(stream_rx_name);
+    stream_rx_name = NULL;
+    MirrorJob *job = g_new0(MirrorJob, 1);
+    job->path = path;
+    job->name = name;
+    g_main_context_invoke_full(NULL, G_PRIORITY_DEFAULT,
+                               (GSourceFunc)mirror_decode_invoke, job, NULL);
+  }
 }
 
 /* Handshake complete (fillp engine thread): attach the StreamFile. */
@@ -492,7 +739,8 @@ static void on_stream_established(FillpEngine *engine, FillpPeer *peer,
   vtp_derive_key((const guint8 *)psk, strlen(psk), key);
   stream_sf = stream_file_new(peer, key);
   stream_file_set_recv_dir(stream_sf, stream_dir);
-  stream_file_set_callbacks(stream_sf, NULL, on_stream_done, NULL);
+  stream_file_set_callbacks(stream_sf, on_stream_rx_meta, on_stream_done,
+                            NULL);
 
   /* Resolve the send spec ("none"/empty = receive-only). */
   gchar *path = NULL;
@@ -771,6 +1019,11 @@ int main(int argc, char *argv[]) {
 
   // Cleanup
   g_print("Stopping transport...\n");
+  if (dmsdp_cl != NULL) {
+    dmsdp_client_free(dmsdp_cl);
+    dmsdp_cl = NULL;
+  }
+  g_free(stream_rx_name);
   if (stream_engine != NULL) {
     fillp_engine_close(stream_engine);
     fillp_engine_unref(stream_engine);

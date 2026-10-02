@@ -18,6 +18,12 @@
  *     derivation, wrong-key / tamper / truncation / ext-bit rejection
  *   - H.264 replay test-file generator: Annex-B invariants, sha-in-name,
  *     determinism, corruption detection
+ *   - RemoteCtrl input encoder (RE'd builders: touch/key/zoom/scroll/
+ *     mouse/input7/wheel/vkey/message; exact byte vectors, pad rule,
+ *     hdr[0] flag remap, dead types 4/5)
+ *   - DMSDP control text (builder byte-exact stand vectors, 3-byte
+ *     NoCrypto frame, parser incl. soft-ignored keys / parse_integer
+ *     degeneracies / trigger-method body, minimal client FSM)
  *
  * No network required; runs in CI.
  */
@@ -38,6 +44,8 @@
 #include "proto/fillp_frame.h"
 #include "proto/vtp_frame.h"
 #include "proto/h264_testfile.h"
+#include "proto/remote_input.h"
+#include "proto/dmsdp.h"
 
 static int failures = 0;
 
@@ -1309,6 +1317,806 @@ static void test_h264_testfile(void) {
   CHECK(h264_testfile_name_sha(NULL) == NULL);
 }
 
+/* ======================= Remote input encoder ======================= */
+
+/*
+ * Expected packet: hdr(10) + body(L) + ts(4) + pad.
+ * hdr[0] = flags1 remap (0x60 -> 0x06), hdr[1] = class, hdr[2..3] =
+ * u16 BE total, hdr[4] = flags2.
+ */
+static void test_remote_input_touch(void) {
+  g_print("remote input: touch vectors (cnt 1/2, zero tail)\n");
+  guint8 buf[64];
+  gsize n = 0;
+
+  RemoteInputEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_TOUCH;
+  ev.subtype = 0; /* down -> action 0x0e */
+  ev.flags1 = 0x60;
+  ev.flags2 = 0x05;
+  ev.touch_cnt = 1;
+  ev.touch_ids[0] = 7;
+  ev.touch_x[0] = 1234.0;
+  ev.touch_y[0] = -5678.0;
+
+  CHECK(remote_input_build(&ev, 0x01020304, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 28); /* L=13, (13+4) odd -> pad */
+  static const guint8 exp1[28] = {
+      0x06, 0x00, 0x00, 0x1c, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x0e, 0x00, 0x0b, 0x01, /* action, lenfield 11, cnt */
+      0x07, 0x04, 0xd2, 0xe9, 0xd2, /* id, x=1234, y=-5678 */
+      0x00, 0x00, 0x00, 0x00, /* zero tail (4*cnt) */
+      0x01, 0x02, 0x03, 0x04, /* ts u32 BE */
+      0x00 /* pad */
+  };
+  CHECK(memcmp(buf, exp1, sizeof(exp1)) == 0);
+
+  /* cnt=2, move (sub 2): L=22, (22+4) even -> no pad, 8 zero tail B */
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_TOUCH;
+  ev.subtype = 2;
+  ev.flags1 = 0x60;
+  ev.flags2 = 0x05;
+  ev.touch_cnt = 2;
+  ev.touch_ids[0] = 1;
+  ev.touch_ids[1] = 2;
+  ev.touch_x[0] = 10.0;
+  ev.touch_y[0] = 30.0;
+  ev.touch_x[1] = -20.0;
+  ev.touch_y[1] = 40.0;
+
+  CHECK(remote_input_build(&ev, 0x01020304, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 36);
+  static const guint8 exp2[36] = {
+      0x06, 0x00, 0x00, 0x24, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x02, 0x00, 0x13, 0x02, /* action 0x02, lenfield 19, cnt 2 */
+      0x01, 0x00, 0x0a, 0x00, 0x1e, /* p1: id 1, (10, 30) */
+      0x02, 0xff, 0xec, 0x00, 0x28, /* p2: id 2, (-20, 40) */
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* zero tail */
+      0x01, 0x02, 0x03, 0x04, /* ts */
+  };
+  CHECK(memcmp(buf, exp2, sizeof(exp2)) == 0);
+}
+
+static void test_remote_input_key_mouse(void) {
+  g_print("remote input: key + mouse vectors\n");
+  guint8 buf[64];
+  gsize n = 0;
+
+  RemoteInputEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_KEY;
+  ev.subtype = 1; /* up -> action 4 */
+  ev.key_f16a = 0x0123;
+  ev.key_f16b = 0x4567;
+  ev.key_f32 = 0xAABBCCDD;
+
+  CHECK(remote_input_build(&ev, 0x00000001, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 26);
+  static const guint8 exp_key[26] = {
+      0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x04, 0x00, 0x09, 0x00, 0x01, 0x23, 0x45, 0x67,
+      0xaa, 0xbb, 0xcc, 0xdd,
+      0x00, 0x00, 0x00, 0x01,
+  };
+  CHECK(memcmp(buf, exp_key, sizeof(exp_key)) == 0);
+
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_MOUSE;
+  ev.subtype = 2; /* up -> action 0x10 */
+  ev.mouse_button = 2;
+  ev.mouse_x = 10.5;  /* trunc -> 10 */
+  ev.mouse_y = -20.7; /* trunc -> -20 */
+  ev.mouse_z = 0.0;
+  ev.mouse_w = 6250.0;
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 26);
+  static const guint8 exp_mouse[26] = {
+      0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x10, 0x00, 0x09, 0x02, /* action 0x10, button 2 */
+      0x00, 0x0a, 0xff, 0xec, 0x00, 0x00, 0x18, 0x6a,
+      0x00, 0x00, 0x00, 0x00,
+  };
+  CHECK(memcmp(buf, exp_mouse, sizeof(exp_mouse)) == 0);
+}
+
+static void test_remote_input_zoom_scroll(void) {
+  g_print("remote input: zoom + scroll vectors\n");
+  guint8 buf[64];
+  gsize n = 0;
+
+  RemoteInputEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_ZOOM;
+  ev.zoom_x = -1.5;  /* trunc -> -1 -> 0xFFFF */
+  ev.zoom_y = 2.25;  /* trunc -> 2 */
+  ev.zoom_pressure = 0.0; /* bits 0 -> 00 00 */
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 24); /* L=9, (9+4) odd -> pad */
+  static const guint8 exp_zoom[24] = {
+      0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x05, 0x00, 0x07,
+      0xff, 0xff, 0x00, 0x02,
+      0x00, 0x00, /* pressure low 2 bytes LE */
+      0x00, 0x00, 0x00, 0x00, /* ts */
+      0x00 /* pad */
+  };
+  CHECK(memcmp(buf, exp_zoom, sizeof(exp_zoom)) == 0);
+
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_SCROLL;
+  ev.subtype = 1; /* action 0x07 */
+  ev.scroll_axis = 1;  /* input[21] -> body[3] */
+  ev.scroll_delta = -2; /* input[20] -> body[4] */
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 20); /* L=5, (5+4) odd -> pad: 10+5+4+1 */
+  static const guint8 exp_scroll[20] = {
+      0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x07, 0x00, 0x03, 0x01, 0xfe,
+      0x00, 0x00, 0x00, 0x00,
+      0x00 /* pad */
+  };
+  CHECK(memcmp(buf, exp_scroll, sizeof(exp_scroll)) == 0);
+}
+
+static void test_remote_input_wheel_vkey(void) {
+  g_print("remote input: wheel + vkey vectors\n");
+  guint8 buf[64];
+  gsize n = 0;
+
+  RemoteInputEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_WHEEL;
+  ev.wheel_dir = 0x07; /* -> ((7&6)<<1)|(7&1) = 0x0d */
+  ev.wheel_f1 = 0x02bc;
+  ev.wheel_x = 50.0;
+  ev.wheel_y = -3.0;
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 24); /* L=10, (10+4) even -> no pad */
+  static const guint8 exp_wheel[24] = {
+      0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x0c, 0x00, 0x07, 0x0d, 0x02, 0xbc,
+      0x00, 0x32, 0xff, 0xfd,
+      0x00, 0x00, 0x00, 0x00,
+  };
+  CHECK(memcmp(buf, exp_wheel, sizeof(exp_wheel)) == 0);
+
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_VKEY;
+  ev.subtype = 2; /* action 4 */
+  ev.vkey_x = 3.2;  /* -> 3 */
+  ev.vkey_y = -8.0; /* -> -8 */
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 22); /* L=7, (7+4) odd -> pad; hdr[1] class = 3 */
+  static const guint8 exp_vkey[22] = {
+      0x00, 0x03, 0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x04, 0x00, 0x05,
+      0x00, 0x03, 0xff, 0xf8,
+      0x00, 0x00, 0x00, 0x00,
+      0x00 /* pad */
+  };
+  CHECK(memcmp(buf, exp_vkey, sizeof(exp_vkey)) == 0);
+}
+
+static void test_remote_input_input7_message(void) {
+  g_print("remote input: input7 (focus/content) + message vectors\n");
+  guint8 buf[64];
+  gsize n = 0;
+
+  RemoteInputEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_INPUT7;
+  ev.subtype = 1; /* focus */
+  ev.focus_f1 = 9;
+  ev.focus_f2 = 1.5; /* -> 1 */
+  ev.focus_f3 = -2.5; /* -> -2 */
+  ev.focus_f4 = 0.0;
+  ev.focus_f5 = 65535.9; /* -> 65535 */
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 26); /* hdr[1] class = 2 */
+  static const guint8 exp_focus[26] = {
+      0x00, 0x02, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x09, 0x09,
+      0x00, 0x01, 0xff, 0xfe, 0x00, 0x00, 0xff, 0xff,
+      0x00, 0x00, 0x00, 0x00,
+  };
+  CHECK(memcmp(buf, exp_focus, sizeof(exp_focus)) == 0);
+
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_INPUT7;
+  ev.subtype = 0; /* content */
+  ev.content = "abc";
+  ev.content_len = 3;
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 22); /* L=8, (8+4) even -> no pad */
+  static const guint8 exp_content[22] = {
+      0x00, 0x02, 0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x05, 0x00, 0x03, /* action, lenfield 5, len 3 */
+      0x61, 0x62, 0x63,
+      0x00, 0x00, 0x00, 0x00,
+  };
+  CHECK(memcmp(buf, exp_content, sizeof(exp_content)) == 0);
+
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_MESSAGE;
+  ev.subtype = 0; /* action 6 */
+  ev.msg_len = 5; /* payload = 3 B */
+  static const guint8 payload3[3] = {0x48, 0x49, 0x00};
+  ev.msg_payload = payload3;
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 24); /* L=10, even -> no pad; hdr[1] class = 4 */
+  static const guint8 exp_msg5[24] = {
+      0x00, 0x04, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x06, 0x00, 0x07, 0x00, 0x05, 0x00, 0x00,
+      0x48, 0x49, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+  };
+  CHECK(memcmp(buf, exp_msg5, sizeof(exp_msg5)) == 0);
+
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_MESSAGE;
+  ev.subtype = 1; /* action 7 */
+  ev.msg_len = 6; /* payload = 4 B */
+  static const guint8 payload4[4] = {1, 2, 3, 4};
+  ev.msg_payload = payload4;
+
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 26); /* L=11, (11+4) odd -> pad */
+  static const guint8 exp_msg6[26] = {
+      0x00, 0x04, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x07, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00,
+      0x01, 0x02, 0x03, 0x04,
+      0x00, 0x00, 0x00, 0x00,
+      0x00 /* pad */
+  };
+  CHECK(memcmp(buf, exp_msg6, sizeof(exp_msg6)) == 0);
+}
+
+static void test_remote_input_errors(void) {
+  g_print("remote input: validation errors\n");
+  guint8 buf[64];
+  gsize n = 0;
+
+  RemoteInputEvent ev;
+  memset(&ev, 0, sizeof(ev));
+
+  /* Dead types */
+  ev.type = 4;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = 5;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = 0xb;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+
+  /* Touch: cnt out of range, bad subtype */
+  ev.type = REMOTE_INPUT_TOUCH;
+  ev.subtype = 3;
+  ev.touch_cnt = 1;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.subtype = 0;
+  ev.touch_cnt = 0;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.touch_cnt = 5;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+
+  /* Bad subtypes per type */
+  ev.type = REMOTE_INPUT_KEY;
+  ev.subtype = 2;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = REMOTE_INPUT_SCROLL;
+  ev.subtype = 2;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = REMOTE_INPUT_MOUSE;
+  ev.subtype = 3;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = REMOTE_INPUT_INPUT7;
+  ev.subtype = 2;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = REMOTE_INPUT_WHEEL;
+  ev.subtype = 2;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = REMOTE_INPUT_VKEY;
+  ev.subtype = 4;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.type = REMOTE_INPUT_MESSAGE;
+  ev.subtype = 2;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+
+  /* Message length bounds */
+  static const guint8 pl[8] = {0};
+  ev.subtype = 0;
+  ev.msg_len = 1; /* (len-2) wraps in the original */
+  ev.msg_payload = pl;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.msg_len = 473;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.msg_len = 5;
+  ev.msg_payload = NULL;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+
+  /* Content length bounds */
+  ev.type = REMOTE_INPUT_INPUT7;
+  ev.subtype = 0;
+  ev.content = "x";
+  ev.content_len = 473;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+  ev.content = NULL;
+  ev.content_len = 1;
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), &n) == -1);
+
+  /* Capacity: touch cnt=1 needs 28, reject 27 */
+  memset(&ev, 0, sizeof(ev));
+  ev.type = REMOTE_INPUT_TOUCH;
+  ev.touch_cnt = 1;
+  CHECK(remote_input_build(&ev, 0, buf, 27, &n) == -1);
+
+  /* NULL arguments */
+  CHECK(remote_input_build(NULL, 0, buf, sizeof(buf), &n) == -1);
+  ev.touch_cnt = 1;
+  CHECK(remote_input_build(&ev, 0, NULL, sizeof(buf), &n) == -1);
+  CHECK(remote_input_build(&ev, 0, buf, sizeof(buf), NULL) == -1);
+}
+
+/* ============================ DMSDP control ============================ */
+
+static const gchar *const kDmsdpSid = "hwphonelink-mirror";
+
+/* Exact stand wire strings (spec 6.5.12). */
+static const gchar *const kDmsdpSetupWire =
+    "SETUP * DMSDP/1.0\r\n"
+    "CSeq: 0\r\n"
+    "ServiceID: hwphonelink-mirror\r\n"
+    "ServiceType: 0\r\n"
+    "DataSessionID: 1\r\n"
+    "Backup: 0\r\n"
+    "Transport: RTP/AVP/UDP;unicast;client_port=54323-54323\r\n"
+    "\r\n";
+
+static const gchar *const kDmsdpSetupReplyWire =
+    "DMSDP/1.0 200 OK\r\n"
+    "CSeq: 0\r\n"
+    "ServiceID: hwphonelink-mirror\r\n"
+    "ServiceType: 0\r\n"
+    "DataSessionID: 1\r\n"
+    "Transport: RTP/AVP/UDP;unicast;client_port=54323-54323;server_port="
+    "54324-54324\r\n"
+    "\r\n";
+
+static const gchar *const kDmsdpPlayWire =
+    "PLAY * DMSDP/1.0\r\n"
+    "CSeq: 1\r\n"
+    "ServiceID: hwphonelink-mirror\r\n"
+    "ServiceType: 0\r\n"
+    "DataSessionID: 1\r\n"
+    "\r\n";
+
+static const gchar *const kDmsdpCommonReplyWire =
+    "DMSDP/1.0 200 OK\r\n"
+    "CSeq: 1\r\n"
+    "ServiceID: hwphonelink-mirror\r\n"
+    "ServiceType: 0\r\n"
+    "DataSessionID: 1\r\n"
+    "\r\n";
+
+static void test_dmsdp_build_wire(void) {
+  g_print("dmsdp: builder byte-exact stand vectors\n");
+  guint8 buf[2048];
+  gsize n = 0;
+  DmsdpMsg m;
+
+  dmsdp_msg_setup(&m, 0, kDmsdpSid, 0, 1, 0, 54323, 54323);
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == 0);
+  CHECK(n == strlen(kDmsdpSetupWire));
+  CHECK(memcmp(buf, kDmsdpSetupWire, n) == 0);
+
+  dmsdp_msg_setup_reply(&m, 0, kDmsdpSid, 0, 1, 54323, 54323, 54324, 54324);
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == 0);
+  CHECK(n == strlen(kDmsdpSetupReplyWire));
+  CHECK(memcmp(buf, kDmsdpSetupReplyWire, n) == 0);
+
+  dmsdp_msg_play(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == 0);
+  CHECK(n == strlen(kDmsdpPlayWire));
+  CHECK(memcmp(buf, kDmsdpPlayWire, n) == 0);
+
+  dmsdp_msg_common_reply(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == 0);
+  CHECK(n == strlen(kDmsdpCommonReplyWire));
+  CHECK(memcmp(buf, kDmsdpCommonReplyWire, n) == 0);
+
+  /* type 8 with status != 200 is rejected */
+  memset(&m, 0, sizeof(m));
+  m.type = DMSDP_TYPE_RESPONSE;
+  m.status = 404;
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == -1);
+
+  /* unknown type rejected */
+  memset(&m, 0, sizeof(m));
+  m.type = 9;
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == -1);
+
+  /* flag set but string missing rejected */
+  memset(&m, 0, sizeof(m));
+  m.type = DMSDP_TYPE_SETUP;
+  m.flags1 = DMSDP_FLAG_SERVICE_ID;
+  m.service_id = NULL;
+  CHECK(dmsdp_build(&m, buf, sizeof(buf), &n) == -1);
+
+  /* cap too small rejected */
+  dmsdp_msg_play(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, buf, 3, &n) == -1);
+}
+
+static void test_dmsdp_frame(void) {
+  g_print("dmsdp: NoCrypto 3-byte frame\n");
+  guint8 buf[4096];
+  gsize n = 0;
+
+  CHECK(dmsdp_frame("abc", 3, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 6);
+  CHECK(buf[0] == 0x00);
+  CHECK(buf[1] == 0x00);
+  CHECK(buf[2] == 0x03);
+  CHECK(memcmp(buf + 3, "abc", 3) == 0);
+
+  /* N > 0x5DC rejected */
+  CHECK(dmsdp_frame("x", 0x5dd, buf, sizeof(buf), &n) == -1);
+
+  /* N == 0x5DC accepted; cap = 3 + N exactly */
+  static gchar big[0x5dc + 3];
+  memset(big, 'a', 0x5dc);
+  CHECK(dmsdp_frame(big, 0x5dc, buf, sizeof(buf), &n) == 0);
+  CHECK(n == 3 + 0x5dc);
+  CHECK(buf[1] == 0x05);
+  CHECK(buf[2] == 0xdc);
+  CHECK(dmsdp_frame(big, 0x5dc, buf, 3 + 0x5dc, &n) == 0);
+  CHECK(dmsdp_frame(big, 0x5dc, buf, 2 + 0x5dc, &n) == -1);
+
+  /* NULL args */
+  CHECK(dmsdp_frame(NULL, 3, buf, sizeof(buf), &n) == -1);
+  CHECK(dmsdp_frame("abc", 3, NULL, sizeof(buf), &n) == -1);
+  CHECK(dmsdp_frame("abc", 3, buf, sizeof(buf), NULL) == -1);
+}
+
+static void test_dmsdp_parse_roundtrip(void) {
+  g_print("dmsdp: parser on the four stand vectors\n");
+  DmsdpParsed p;
+
+  /* SETUP */
+  CHECK(dmsdp_parse(kDmsdpSetupWire, strlen(kDmsdpSetupWire), &p) == 0);
+  CHECK(p.type == DMSDP_TYPE_SETUP);
+  CHECK(p.flags1 == 0x81c01); /* CSeq|SID|SType|DSID|Transport */
+  CHECK(p.flags2 == 0x2); /* Backup */
+  CHECK(p.cseq == 0);
+  CHECK(p.service_id != NULL && strcmp(p.service_id, "hwphonelink-mirror") == 0);
+  CHECK(p.service_type == 0);
+  CHECK(p.data_session_id == 1);
+  CHECK(p.client_port_lo == 54323 && p.client_port_hi == 54323);
+  CHECK(p.server_port_lo == 0 && p.server_port_hi == 0);
+  CHECK(p.backup == 0);
+  dmsdp_parsed_free(&p);
+
+  /* SetupReply (response 200, combined Transport) */
+  CHECK(dmsdp_parse(kDmsdpSetupReplyWire, strlen(kDmsdpSetupReplyWire), &p) == 0);
+  CHECK(p.type == DMSDP_TYPE_RESPONSE);
+  CHECK(p.response_fail == 0);
+  CHECK(p.flags1 == 0x81c01);
+  CHECK(p.flags2 == 0);
+  CHECK(p.cseq == 0);
+  CHECK(p.client_port_lo == 54323 && p.client_port_hi == 54323);
+  CHECK(p.server_port_lo == 54324 && p.server_port_hi == 54324);
+  dmsdp_parsed_free(&p);
+
+  /* PLAY */
+  CHECK(dmsdp_parse(kDmsdpPlayWire, strlen(kDmsdpPlayWire), &p) == 0);
+  CHECK(p.type == DMSDP_TYPE_PLAY);
+  CHECK(p.flags1 == 0x1c01);
+  CHECK(p.flags2 == 0);
+  CHECK(p.cseq == 1);
+  CHECK(p.data_session_id == 1);
+  dmsdp_parsed_free(&p);
+
+  /* CommonReply */
+  CHECK(dmsdp_parse(kDmsdpCommonReplyWire, strlen(kDmsdpCommonReplyWire), &p) == 0);
+  CHECK(p.type == DMSDP_TYPE_RESPONSE);
+  CHECK(p.response_fail == 0);
+  CHECK(p.flags1 == 0x1c01);
+  CHECK(p.cseq == 1);
+  dmsdp_parsed_free(&p);
+
+  /* Frame wrap + strip + parse */
+  guint8 frame[512];
+  gsize fn = 0;
+  CHECK(dmsdp_frame(kDmsdpSetupWire, strlen(kDmsdpSetupWire), frame,
+                    sizeof(frame), &fn) == 0);
+  CHECK(frame[0] == 0x00);
+  gsize tl = ((gsize)frame[1] << 8) | frame[2];
+  CHECK(tl == strlen(kDmsdpSetupWire));
+  CHECK(dmsdp_parse((const gchar *)frame + 3, tl, &p) == 0);
+  CHECK(p.type == DMSDP_TYPE_SETUP);
+  dmsdp_parsed_free(&p);
+}
+
+static void test_dmsdp_parse_errors(void) {
+  g_print("dmsdp: parser error cases\n");
+  DmsdpParsed p;
+
+  /* no colon -> -5 */
+  static const gchar *t1 = "PLAY * DMSDP/1.0\r\nNoColon\r\n\r\n";
+  CHECK(dmsdp_parse(t1, strlen(t1), &p) == -5);
+
+  /* unknown key silently ignored */
+  static const gchar *t2 = "PLAY * DMSDP/1.0\r\nBogus: 1\r\n\r\n";
+  CHECK(dmsdp_parse(t2, strlen(t2), &p) == 0);
+  CHECK(p.flags1 == 0);
+  dmsdp_parsed_free(&p);
+
+  /* prefix key match: "CSe" -> CSeq */
+  static const gchar *t3 = "PLAY * DMSDP/1.0\r\nCSe: 1\r\n\r\n";
+  CHECK(dmsdp_parse(t3, strlen(t3), &p) == 0);
+  CHECK(p.cseq == 1);
+  dmsdp_parsed_free(&p);
+
+  /* response 404 -> type 8, response_fail */
+  static const gchar *t4 = "DMSDP/1.0 404 NF\r\n\r\n";
+  CHECK(dmsdp_parse(t4, strlen(t4), &p) == 0);
+  CHECK(p.type == DMSDP_TYPE_RESPONSE);
+  CHECK(p.response_fail == 1);
+  dmsdp_parsed_free(&p);
+
+  /* all-digits response line -> -2 */
+  static const gchar *t5 = "DMSDP/1.0 200\r\n\r\n";
+  CHECK(dmsdp_parse(t5, strlen(t5), &p) == -2);
+
+  /* no digits in response line -> -2 */
+  static const gchar *t6 = "DMSDP/1.0  OK\r\n\r\n";
+  CHECK(dmsdp_parse(t6, strlen(t6), &p) == -2);
+
+  /* reason longer than 12 chars -> -2 */
+  static const gchar *t7 = "DMSDP/1.0 200 VeryLongReason\r\n\r\n";
+  CHECK(dmsdp_parse(t7, strlen(t7), &p) == -2);
+
+  /* Codec soft-ignored: flag bit cleared */
+  static const gchar *t8 = "PLAY * DMSDP/1.0\r\nCodec: 1\r\n\r\n";
+  CHECK(dmsdp_parse(t8, strlen(t8), &p) == 0);
+  CHECK(p.flags1 == 0);
+  dmsdp_parsed_free(&p);
+
+  /* KaRetry soft-ignored */
+  static const gchar *t9 = "PLAY * DMSDP/1.0\r\nKaRetry: 5\r\n\r\n";
+  CHECK(dmsdp_parse(t9, strlen(t9), &p) == 0);
+  CHECK(p.flags1 == 0);
+  dmsdp_parsed_free(&p);
+
+  /* "CSeq:3" (no space after colon): value "3" parses fine (RE:
+   * ParseInteger has no sign for '3'; atoi("3") = 3) */
+  static const gchar *t10 = "PLAY * DMSDP/1.0\r\nCSeq:3\r\n\r\n";
+  CHECK(dmsdp_parse(t10, strlen(t10), &p) == 0);
+  CHECK(p.cseq == 3);
+  dmsdp_parsed_free(&p);
+
+  /* value " 3" (leading space) parses fine */
+  static const gchar *t11 = "PLAY * DMSDP/1.0\r\nCSeq: 3\r\n\r\n";
+  CHECK(dmsdp_parse(t11, strlen(t11), &p) == 0);
+  CHECK(p.cseq == 3);
+  dmsdp_parsed_free(&p);
+
+  /* ParseInteger degenerates (RE 0x180019b40): the sign slot
+   * ((c-0x2b)&0xfd==0) holds exactly for '+' and '/' */
+  static const gchar *t17a = "PLAY * DMSDP/1.0\r\nCSeq: +3\r\n\r\n";
+  CHECK(dmsdp_parse(t17a, strlen(t17a), &p) == 0);
+  CHECK(p.cseq == 3);
+  dmsdp_parsed_free(&p);
+
+  /* '/3': '/' is NOT a sign slot (mask 0xfd keeps only '+'/'-');
+   * the digit check fails on '/' -> -1 */
+  static const gchar *t17b = "PLAY * DMSDP/1.0\r\nCSeq: /3\r\n\r\n";
+  CHECK(dmsdp_parse(t17b, strlen(t17b), &p) == -1);
+
+  /* "-3": '-' IS a sign slot; digits OK; atoi("-3") wraps -> 0xfffffffd */
+  static const gchar *t17c = "PLAY * DMSDP/1.0\r\nCSeq: -3\r\n\r\n";
+  CHECK(dmsdp_parse(t17c, strlen(t17c), &p) == 0);
+  CHECK(p.cseq == 0xfffffffd);
+  dmsdp_parsed_free(&p);
+
+  /* " +": space then sign, strlen == 2 -> no lone-sign error; the
+   * digit loop is empty and atoi(" +") = 0 */
+  static const gchar *t17d = "PLAY * DMSDP/1.0\r\nCSeq: +\r\n\r\n";
+  CHECK(dmsdp_parse(t17d, strlen(t17d), &p) == 0);
+  CHECK(p.cseq == 0);
+  dmsdp_parsed_free(&p);
+
+  /* lone sign slot (no space): strlen == 1 -> -1 */
+  static const gchar *t17h = "PLAY * DMSDP/1.0\r\nCSeq:+\r\n\r\n";
+  CHECK(dmsdp_parse(t17h, strlen(t17h), &p) == -1);
+
+  /* trailing junk -> -1 */
+  static const gchar *t17e = "PLAY * DMSDP/1.0\r\nCSeq: 12x\r\n\r\n";
+  CHECK(dmsdp_parse(t17e, strlen(t17e), &p) == -1);
+
+  /* value longer than 16 bytes -> -9 */
+  static const gchar *t17f =
+      "PLAY * DMSDP/1.0\r\nCSeq: 12345678901234567\r\n\r\n";
+  CHECK(dmsdp_parse(t17f, strlen(t17f), &p) == -9);
+
+  /* value " " (single space): buffer is " ", atoi(" ") = 0 */
+  static const gchar *t17g = "PLAY * DMSDP/1.0\r\nCSeq: \r\n\r\n";
+  CHECK(dmsdp_parse(t17g, strlen(t17g), &p) == 0);
+  CHECK(p.cseq == 0);
+  dmsdp_parsed_free(&p);
+
+  /* trigger-method body, CL 28 = exact trigger 1 */
+  static const gchar *t12 =
+      "PLAY * DMSDP/1.0\r\nContent-Length: 28\r\n\r\n"
+      "msdp_trigger_method: SETUP\r\n";
+  CHECK(dmsdp_parse(t12, strlen(t12), &p) == 0);
+  CHECK(p.trigger_idx == 1);
+  dmsdp_parsed_free(&p);
+
+  /* trigger body with wrong length content -> -2 */
+  static const gchar *t13 =
+      "PLAY * DMSDP/1.0\r\nContent-Length: 28\r\n\r\n"
+      "msdp_trigger_method: FOOOO\r\n";
+  CHECK(dmsdp_parse(t13, strlen(t13), &p) == -2);
+
+  /* Content-Length mismatch -> -2 */
+  static const gchar *t14 =
+      "PLAY * DMSDP/1.0\r\nContent-Length: 27\r\n\r\n"
+      "msdp_trigger_method: SETUP\r\n";
+  CHECK(dmsdp_parse(t14, strlen(t14), &p) == -2);
+
+  /* repeated Transport: no dup check in the RE; the last line
+   * re-parses and its first match wins -> 0, client 3-4 */
+  static const gchar *t15 =
+      "PLAY * DMSDP/1.0\r\n"
+      "Transport: RTP/AVP/UDP;unicast;client_port=1-2\r\n"
+      "Transport: RTP/AVP/UDP;unicast;client_port=3-4\r\n"
+      "\r\n";
+  CHECK(dmsdp_parse(t15, strlen(t15), &p) == 0);
+  CHECK(p.client_port_lo == 3 && p.client_port_hi == 4);
+  CHECK(p.server_port_lo == 0 && p.server_port_hi == 0);
+  dmsdp_parsed_free(&p);
+
+  /* bad client port range: silent 0, ports stay 0, server pass
+   * skipped (RE jumps to the epilogue) */
+  static const gchar *t18 =
+      "PLAY * DMSDP/1.0\r\n"
+      "Transport: RTP/AVP/UDP;unicast;client_port=x;server_port=1-2\r\n"
+      "\r\n";
+  CHECK(dmsdp_parse(t18, strlen(t18), &p) == 0);
+  CHECK(p.client_port_lo == 0 && p.client_port_hi == 0);
+  CHECK(p.server_port_lo == 0 && p.server_port_hi == 0);
+  dmsdp_parsed_free(&p);
+
+  /* Transport prefix mismatch -> silent 0 (no fields touched) */
+  static const gchar *t19 =
+      "PLAY * DMSDP/1.0\r\nTransport: UDP/AVP/UDP;unicast;client_port=1-2\r\n"
+      "\r\n";
+  CHECK(dmsdp_parse(t19, strlen(t19), &p) == 0);
+  CHECK(p.client_port_lo == 0);
+  CHECK((p.flags1 & 0x00080000u) != 0); /* the flag is OR'd before parse */
+  dmsdp_parsed_free(&p);
+
+  /* empty input -> -2 */
+  CHECK(dmsdp_parse("", 0, &p) == -2);
+
+  /* start line without CRLF -> -2 */
+  static const gchar *t16 = "PLAY * DMSDP/1.0";
+  CHECK(dmsdp_parse(t16, strlen(t16), &p) == -2);
+}
+
+static void test_dmsdp_client_fsm(void) {
+  g_print("dmsdp: client FSM happy path + error cases\n");
+  DmsdpClient *c = dmsdp_client_new();
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_INIT);
+
+  DmsdpMsg m;
+  DmsdpParsed p;
+  guint8 frame[2048];
+  gchar text[2048];
+  gsize n = 0;
+
+  /* happy path */
+  dmsdp_msg_setup(&m, 0, kDmsdpSid, 0, 1, 0, 54323, 54323);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == 0);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_WAIT_SETUP_REPLY);
+  gsize tl = strlen(kDmsdpSetupWire);
+  CHECK(n == 3 + tl);
+  CHECK(frame[0] == 0x00);
+  CHECK(frame[1] == (guint8)(tl >> 8));
+  CHECK(frame[2] == (guint8)(tl & 0xff));
+  CHECK(memcmp(frame + 3, kDmsdpSetupWire, tl) == 0);
+
+  dmsdp_msg_setup_reply(&m, 0, kDmsdpSid, 0, 1, 54323, 54323, 54324, 54324);
+  CHECK(dmsdp_build(&m, (guint8 *)text, sizeof(text), &n) == 0);
+  CHECK(dmsdp_parse(text, n, &p) == 0);
+  CHECK(dmsdp_client_recv(c, &p) == 0);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_SEND_PLAY);
+  dmsdp_parsed_free(&p);
+
+  dmsdp_msg_play(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == 0);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_WAIT_PLAY_REPLY);
+  CHECK(n == 3 + strlen(kDmsdpPlayWire));
+  CHECK(memcmp(frame + 3, kDmsdpPlayWire, strlen(kDmsdpPlayWire)) == 0);
+
+  dmsdp_msg_common_reply(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, (guint8 *)text, sizeof(text), &n) == 0);
+  CHECK(dmsdp_parse(text, n, &p) == 0);
+  CHECK(dmsdp_client_recv(c, &p) == 0);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_READY);
+
+  /* READY ignores further replies */
+  CHECK(dmsdp_client_recv(c, &p) == 0);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_READY);
+  dmsdp_parsed_free(&p);
+  dmsdp_client_free(c);
+
+  /* error: send PLAY in INIT -> ERROR */
+  c = dmsdp_client_new();
+  dmsdp_msg_play(&m, 0, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == -1);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_ERROR);
+  dmsdp_client_free(c);
+
+  /* error: SETUP with cseq != 0 in INIT -> ERROR */
+  c = dmsdp_client_new();
+  dmsdp_msg_setup(&m, 5, kDmsdpSid, 0, 1, 0, 54323, 54323);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == -1);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_ERROR);
+  dmsdp_client_free(c);
+
+  /* error: reply with wrong CSeq in WAIT_SETUP_REPLY -> ERROR */
+  c = dmsdp_client_new();
+  dmsdp_msg_setup(&m, 0, kDmsdpSid, 0, 1, 0, 54323, 54323);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == 0);
+  dmsdp_msg_common_reply(&m, 7, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, (guint8 *)text, sizeof(text), &n) == 0);
+  CHECK(dmsdp_parse(text, n, &p) == 0);
+  CHECK(dmsdp_client_recv(c, &p) == -1);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_ERROR);
+  dmsdp_parsed_free(&p);
+  dmsdp_client_free(c);
+
+  /* error: reply before any send (INIT) -> ERROR */
+  c = dmsdp_client_new();
+  dmsdp_msg_common_reply(&m, 0, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, (guint8 *)text, sizeof(text), &n) == 0);
+  CHECK(dmsdp_parse(text, n, &p) == 0);
+  CHECK(dmsdp_client_recv(c, &p) == -1);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_ERROR);
+  dmsdp_parsed_free(&p);
+  dmsdp_client_free(c);
+
+  /* error: send after READY -> -1, state stays READY */
+  c = dmsdp_client_new();
+  dmsdp_msg_setup(&m, 0, kDmsdpSid, 0, 1, 0, 54323, 54323);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == 0);
+  dmsdp_msg_setup_reply(&m, 0, kDmsdpSid, 0, 1, 54323, 54323, 54324, 54324);
+  CHECK(dmsdp_build(&m, (guint8 *)text, sizeof(text), &n) == 0);
+  CHECK(dmsdp_parse(text, n, &p) == 0);
+  CHECK(dmsdp_client_recv(c, &p) == 0);
+  dmsdp_msg_play(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == 0);
+  dmsdp_msg_common_reply(&m, 1, kDmsdpSid, 0, 1);
+  CHECK(dmsdp_build(&m, (guint8 *)text, sizeof(text), &n) == 0);
+  CHECK(dmsdp_parse(text, n, &p) == 0);
+  CHECK(dmsdp_client_recv(c, &p) == 0);
+  CHECK(dmsdp_client_send(c, &m, frame, sizeof(frame), &n) == -1);
+  CHECK(dmsdp_client_state(c) == DMSDP_CL_READY);
+  dmsdp_parsed_free(&p);
+  dmsdp_client_free(c);
+}
+
 /* ============================ Main ============================ */
 
 int main(void) {
@@ -1343,6 +2151,17 @@ int main(void) {
   test_fillp_cookie();
   test_vtp_frame();
   test_h264_testfile();
+  test_remote_input_touch();
+  test_remote_input_key_mouse();
+  test_remote_input_zoom_scroll();
+  test_remote_input_wheel_vkey();
+  test_remote_input_input7_message();
+  test_remote_input_errors();
+  test_dmsdp_build_wire();
+  test_dmsdp_frame();
+  test_dmsdp_parse_roundtrip();
+  test_dmsdp_parse_errors();
+  test_dmsdp_client_fsm();
 
   g_mutex_clear(&test_lock);
   g_cond_clear(&test_cond);
